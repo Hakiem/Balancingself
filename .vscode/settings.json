@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "mpu6050.h": "c",
+        "string.h": "c",
+        "main.h": "c",
+        "board.h": "c",
+        "math.h": "c",
+        "stdio.h": "c",
+        "stm32f3xx_hal.h": "c"
+    }
+}
