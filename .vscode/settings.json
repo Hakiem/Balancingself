@@ -7,5 +7,11 @@
         "math.h": "c",
         "stdio.h": "c",
         "stm32f3xx_hal.h": "c"
-    }
+    },
+    "editor.formatOnSave": true,
+    "C_Cpp.clang_format_style": "file",
+    "[c]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    "CodeGPT.apiKey": "DeepSeek"
 }

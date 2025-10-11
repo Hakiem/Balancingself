@@ -1,0 +1,9 @@
+BasedOnStyle: WebKit
+IndentWidth: 4
+UseTab: Never
+TabWidth: 4
+ColumnLimit: 80
+PointerAlignment: Left
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+IndentCaseLabels: false
