@@ -148,6 +148,19 @@ void dump_tmc_diagnostics(tmc2208::Driver& tmc)
     if (read_and_print_reg(tmc, "  PWMCONF", tmc2208::REG_PWMCONF, val)) {
         (void)val;
     }
+    if (read_and_print_reg(tmc, "  IHOLD_IRUN", tmc2208::REG_IHOLD_IRUN, val)) {
+        uint32_t ihold = val & 0x1F;
+        uint32_t irun = (val >> 8) & 0x1F;
+        uint32_t iholddelay = (val >> 16) & 0x0F;
+        send_uart2_fmt("    IHOLD=%lu IRUN=%lu IHOLDDELAY=%lu\r\n",
+            static_cast<unsigned long>(ihold),
+            static_cast<unsigned long>(irun),
+            static_cast<unsigned long>(iholddelay));
+    }
+    if (read_and_print_reg(tmc, "  TPOWERDOWN", tmc2208::REG_TPOWERDOWN, val)) {
+        send_uart2_fmt("    TPOWERDOWN=%lu (2^18 tCLK units)\r\n",
+            static_cast<unsigned long>(val & 0xFFu));
+    }
     if (read_and_print_reg(tmc, "  PWM_SCALE", tmc2208::REG_PWM_SCALE, val)) {
         (void)val;
     }
@@ -196,6 +209,41 @@ void log_tmc_frame(const char* tag, const uint8_t* data, size_t len)
         }
     }
     send_uart2("\r\n", 2);
+}
+
+constexpr int32_t kVactualLimit = 0x007FFFFF; // ±23-bit range supported by VACTUAL
+
+uint32_t encode_vactual(int32_t velocity)
+{
+    if (velocity > kVactualLimit) {
+        velocity = kVactualLimit;
+    } else if (velocity < -kVactualLimit) {
+        velocity = -kVactualLimit;
+    }
+    return static_cast<uint32_t>(velocity) & 0x00FFFFFFu;
+}
+
+void set_velocity(tmc2208::Driver& tmc, int32_t velocity)
+{
+    tmc.write_reg(tmc2208::REG_VACTUAL, encode_vactual(velocity));
+}
+
+void run_motion_sequence(tmc2208::Driver& tmc)
+{
+    // Positive velocity -> forward.
+    const int32_t kForwardSpeed = 2000; // microsteps per second
+    const int32_t kReverseSpeed = -2000;
+
+    set_velocity(tmc, kForwardSpeed);
+    HAL_Delay(10000); // run forward for 10 s
+
+    set_velocity(tmc, 0);
+    HAL_Delay(2000); // pause for 2 s
+
+    set_velocity(tmc, kReverseSpeed);
+    HAL_Delay(6000); // run reverse for 6 s
+
+    set_velocity(tmc, 0); // stop
 }
 }
 
@@ -247,8 +295,7 @@ int main(void)
     }
 
     uint8_t microstep_code = 0;
-    if (tmc_ready
-        && !tmc2208::Driver::microsteps_to_code(16, microstep_code)) {
+    if (tmc_ready && !tmc2208::Driver::microsteps_to_code(16, microstep_code)) {
         report_tmc_status("microstep decode",
             tmc2208::Driver::Status::InvalidParam);
         tmc_ready = false;
@@ -259,7 +306,11 @@ int main(void)
     }
 
     if (tmc_ready) {
-        tmc.set_currents(4, 8, 4); // light hold/run current for bench bring-up
+        tmc.set_currents(10, 26, 4);
+        if (tmc.last_status() != tmc2208::Driver::Status::Ok) {
+            report_tmc_status("set currents", tmc.last_status());
+            tmc_ready = false;
+        }
 
         const uint32_t readback = tmc.read_reg(tmc2208::REG_GCONF);
         if (tmc.last_status() != tmc2208::Driver::Status::Ok) {
@@ -288,6 +339,8 @@ int main(void)
             }
         }
 
+        dump_tmc_diagnostics(tmc);
+        run_motion_sequence(tmc);
         dump_tmc_diagnostics(tmc);
     }
 
