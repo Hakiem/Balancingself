@@ -31,6 +31,12 @@ char cmd_buffer[128];
 uint8_t cmd_index = 0;
 bool cmd_ready = false;
 
+// Continuous spinning state
+bool continuous_spinning = false;
+motion::Direction spin_direction = motion::Direction::Forward;
+float current_spin_speed
+    = 0.0f; // Track current spinning speed for smooth deceleration
+
 // Non-blocking command input handler
 void handle_uart_input()
 {
@@ -51,7 +57,7 @@ void handle_uart_input()
 }
 
 // Command parser and executor
-void process_command(motion::MotionProfile& mp)
+void process_command(motion::MotionProfile& mp, TMC2208::Device& drv)
 {
     if (!cmd_ready)
         return;
@@ -120,9 +126,178 @@ void process_command(motion::MotionProfile& mp)
         mp.stop();
         logsys::printf("[RUN] Triangle done.\r\n");
 
-    } else if (strcmp(token, "stop") == 0) {
+    } else if (strcmp(token, "test") == 0) {
+        // Simple test: short forward movement
+        logsys::printf("[TEST] Running short test movement...\r\n");
+        mp.runSCurve(1.0f, 5000.0f, motion::Direction::Forward, 10);
         mp.stop();
-        logsys::printf("[RUN] Motor stopped.\r\n");
+        logsys::printf(
+            "[TEST] Test done. Motor should have moved slightly.\r\n");
+
+    } else if (strcmp(token, "current") == 0) {
+        // Show current settings (configured values, not read from chip)
+        logsys::printf("[INFO] Configured: IHOLD=8, IRUN=24, IHOLDDELAY=8\r\n");
+        logsys::printf("[INFO] Note: IHOLD_IRUN is write-only register\r\n");
+
+    } else if (strcmp(token, "disable") == 0) {
+        // Disable motor to reduce power consumption
+        drv.ihold_irun(0, 0, 0);
+        continuous_spinning = false;
+        current_spin_speed = 0.0f;
+        logsys::printf(
+            "[INFO] Motor disabled - current should drop to ~0mA\r\n");
+
+    } else if (strcmp(token, "enable") == 0) {
+        // Re-enable motor with original settings
+        drv.ihold_irun(8, 24, 8);
+        logsys::printf("[INFO] Motor re-enabled with IHOLD=8, IRUN=24\r\n");
+
+    } else if (strcmp(token, "turbo") == 0) {
+        // Set maximum current for highest speed capability
+        drv.ihold_irun(8, 31, 8);
+        logsys::printf("[INFO] TURBO MODE: IHOLD=8, IRUN=31 (MAX CURRENT)\r\n");
+        logsys::printf(
+            "[WARN] Motor will run hotter - monitor temperature!\r\n");
+
+    } else if (strcmp(token, "spin") == 0) {
+        // Format: spin [forward/reverse] - Continuous spinning at max speed
+        motion::Direction dir = motion::Direction::Forward;
+
+        token = strtok(nullptr, " ");
+        if (token && strcmp(token, "reverse") == 0) {
+            dir = motion::Direction::Reverse;
+        }
+
+        continuous_spinning = true;
+        spin_direction = dir;
+
+        // Use a much lower speed to avoid motor stalling/noise
+        const float spin_speed
+            = 8000.0f; // microsteps/s - reduced for reliability
+        current_spin_speed = spin_speed; // Store for deceleration
+
+        logsys::printf(
+            "[SPIN] Starting %s spin with gradual acceleration...\r\n",
+            (dir == motion::Direction::Forward) ? "forward" : "reverse");
+
+        // Gradually ramp up to target speed to avoid stalling
+        const int steps = 20; // Number of acceleration steps
+        const uint32_t step_delay_ms
+            = 50; // 50ms between steps = 1 second total ramp
+
+        for (int i = 1; i <= steps; i++) {
+            float current_speed = (spin_speed * i) / steps;
+            const int32_t vactual = mp.vactualFromUSteps(
+                (dir == motion::Direction::Forward) ? current_speed
+                                                    : -current_speed);
+
+            if (!drv.vactual(vactual)) {
+                logsys::printf("[ERR] Failed to set speed step %d\r\n", i);
+                continuous_spinning = false;
+                return;
+            }
+            HAL_Delay(step_delay_ms);
+        }
+
+        logsys::printf("[SPIN] Continuous %s spinning at %.0f usteps/s\r\n",
+            (dir == motion::Direction::Forward) ? "forward" : "reverse",
+            spin_speed);
+        logsys::printf(
+            "[SPIN] Send any command to stop (e.g., 'stop', 'x')\r\n");
+
+    } else if (strcmp(token, "turbo-spin") == 0) {
+        // Format: turbo-spin [forward/reverse] - Maximum speed spinning
+        motion::Direction dir = motion::Direction::Forward;
+
+        token = strtok(nullptr, " ");
+        if (token && strcmp(token, "reverse") == 0) {
+            dir = motion::Direction::Reverse;
+        }
+
+        // First set maximum current for highest torque capability
+        drv.ihold_irun(8, 31, 8);
+        logsys::printf("[TURBO] Setting maximum current (IRUN=31)...\r\n");
+        HAL_Delay(100); // Let current setting stabilize
+
+        continuous_spinning = true;
+        spin_direction = dir;
+
+        // Use maximum safe speed with high current
+        const float turbo_speed
+            = 40000.0f; // microsteps/s - pushing towards motor limits!
+        current_spin_speed = turbo_speed; // Store for deceleration
+
+        logsys::printf(
+            "[TURBO] Starting %s TURBO spin with gradual acceleration...\r\n",
+            (dir == motion::Direction::Forward) ? "forward" : "reverse");
+        logsys::printf(
+            "[WARN] Motor will run hotter - monitor temperature!\r\n");
+
+        // Gradually ramp up to turbo speed
+        const int steps = 25; // More steps for higher speed
+        const uint32_t step_delay_ms
+            = 60; // 60ms between steps = 1.5 second total ramp
+
+        for (int i = 1; i <= steps; i++) {
+            float current_speed = (turbo_speed * i) / steps;
+            const int32_t vactual = mp.vactualFromUSteps(
+                (dir == motion::Direction::Forward) ? current_speed
+                                                    : -current_speed);
+
+            if (!drv.vactual(vactual)) {
+                logsys::printf(
+                    "[ERR] Failed to set turbo speed step %d\r\n", i);
+                continuous_spinning = false;
+                return;
+            }
+            HAL_Delay(step_delay_ms);
+        }
+
+        logsys::printf(
+            "[TURBO] Continuous %s TURBO spinning at %.0f usteps/s\r\n",
+            (dir == motion::Direction::Forward) ? "forward" : "reverse",
+            turbo_speed);
+        logsys::printf(
+            "[TURBO] Send any command to stop (e.g., 'stop', 'x')\r\n");
+
+    } else if (strcmp(token, "x") == 0 || strcmp(token, "stop") == 0) {
+        if (continuous_spinning) {
+            continuous_spinning = false;
+
+            // Get current speed for gradual deceleration
+            const float decel_from_speed = current_spin_speed;
+
+            logsys::printf("[SPIN] Gradually decelerating from %.0f usteps/s "
+                           "to stop...\r\n",
+                decel_from_speed);
+
+            // Gradually ramp down from current speed to zero
+            const int steps
+                = 15; // Fewer steps for quicker stop, but still smooth
+            const uint32_t step_delay_ms
+                = 40; // 40ms between steps = 0.6 second total decel
+
+            for (int i = steps - 1; i >= 0; i--) {
+                float decel_speed = (decel_from_speed * i) / steps;
+                const int32_t vactual = mp.vactualFromUSteps(
+                    (spin_direction == motion::Direction::Forward)
+                        ? decel_speed
+                        : -decel_speed);
+
+                if (!drv.vactual(vactual)) {
+                    logsys::printf("[ERR] Failed to set decel step %d\r\n", i);
+                    break;
+                }
+                HAL_Delay(step_delay_ms);
+            }
+
+            // Final stop
+            drv.vactual(0);
+            logsys::printf("[SPIN] Continuous spinning stopped smoothly.\r\n");
+        } else {
+            mp.stop();
+            logsys::printf("[RUN] Motor stopped.\r\n");
+        }
 
     } else if (strcmp(token, "help") == 0) {
         logsys::printf("Commands:\r\n");
@@ -130,9 +305,22 @@ void process_command(motion::MotionProfile& mp)
             "  scurve <duration> <peak_speed> [forward/reverse]\r\n");
         logsys::printf(
             "  triangle <duration> <peak_speed> [forward/reverse]\r\n");
-        logsys::printf("  stop\r\n");
-        logsys::printf("  help\r\n");
-        logsys::printf("Example: scurve 3.0 15000 forward\r\n");
+        logsys::printf("  spin [forward/reverse] - Continuous smooth spinning "
+                       "(8k usteps/s)\r\n");
+        logsys::printf("  turbo-spin [forward/reverse] - MAXIMUM speed "
+                       "spinning (40k usteps/s)\r\n");
+        logsys::printf("  test - Quick movement test\r\n");
+        logsys::printf(
+            "  turbo - Set maximum current (IRUN=31) for higher speeds\r\n");
+        logsys::printf("  stop/x - Stop motor smoothly\r\n");
+        logsys::printf("  current - Show current settings\r\n");
+        logsys::printf("  disable - Disable motor (0mA consumption)\r\n");
+        logsys::printf("  enable - Re-enable motor\r\n");
+        logsys::printf("  help - Show this help\r\n");
+        logsys::printf("Examples:\r\n");
+        logsys::printf("  scurve 3.0 15000 forward\r\n");
+        logsys::printf("  spin reverse\r\n");
+        logsys::printf("  turbo-spin forward  # Maximum speed!\r\n");
 
     } else {
         logsys::printf("[ERR] Unknown command. Type 'help' for usage.\r\n");
@@ -218,7 +406,7 @@ int main(void)
     while (1) {
         // Handle incoming commands
         handle_uart_input();
-        process_command(mp);
+        process_command(mp, drv);
 
         // Blink LED to show system is alive
         static uint32_t last_blink = 0;
