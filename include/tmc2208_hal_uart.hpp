@@ -7,6 +7,10 @@
 #include <functional>
 #include <utility>
 
+// TMC22xx UART Driver - Compatible with TMC2208, TMC2209, TMC2224, etc.
+// Register definitions use TMC2208 namespace (shared register set)
+// Currently configured for TMC2209 with UART addressing support
+
 // ---------- CRC8 (TMC22xx spec: CRC8-ATM, LSB-first, polynomial 0x07)
 inline uint8_t crc8_tmc(const uint8_t* bytes, size_t n)
 {
@@ -25,10 +29,10 @@ inline uint8_t crc8_tmc(const uint8_t* bytes, size_t n)
     return crc;
 }
 
-// ===================== TMC2208 UART Transport =====================
+// ===================== TMC22xx UART Transport =====================
 // NOTE: This version uses UartBridge (class-based, half-duplex aware) instead
-// of free functions.
-class TMC2208_UART_Transport
+// of free functions. Compatible with TMC2208, TMC2209, TMC2224, etc.
+class TMC22xx_UART_Transport
 {
 public:
     struct Config {
@@ -46,7 +50,7 @@ public:
 
     // slave_addr is 7-bit TMC node (almost always 0x00 unless you wired
     // multiple)
-    explicit TMC2208_UART_Transport(
+    explicit TMC22xx_UART_Transport(
         UART_Bridge* bridge, uint8_t slave_addr = 0x00, Config cfg = Config())
         : bridge_(bridge)
         , slave_(slave_addr)
@@ -297,7 +301,7 @@ namespace drv_status
 class Device
 {
 public:
-    explicit Device(TMC2208_UART_Transport& t)
+    explicit Device(TMC22xx_UART_Transport& t)
         : t_(t)
     {
     }
@@ -442,7 +446,7 @@ public:
     bool drv_status_raw(uint32_t& v) { return rd(DRV_STATUS, v); }
 
 private:
-    TMC2208_UART_Transport& t_;
+    TMC22xx_UART_Transport& t_;
     bool rd(uint8_t r, uint32_t& out) { return t_.regRead(r, out); }
     bool wr(uint8_t r, uint32_t v) { return t_.regWrite(r, v); }
     bool setf(uint8_t reg, uint32_t msk, unsigned pos, uint32_t val)

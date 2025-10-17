@@ -9,7 +9,7 @@
 extern "C" {
 I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
-UART_HandleTypeDef huart1; // For TMC2208 Half-Duplex
+UART_HandleTypeDef huart1; // For TMC2209 Half-Duplex
 UART_HandleTypeDef huart2;
 TIM_HandleTypeDef htim2;
 }
@@ -57,7 +57,8 @@ void handle_uart_input()
 }
 
 // Command parser and executor
-void process_command(motion::MotionProfile& mp, TMC2208::Device& drv)
+void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
+    TMC22xx_UART_Transport& transport)
 {
     if (!cmd_ready)
         return;
@@ -299,8 +300,90 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv)
             logsys::printf("[RUN] Motor stopped.\r\n");
         }
 
+    } else if (strcmp(token, "scan") == 0) {
+        // Scan for TMC2209 drivers at addresses 0x00-0x03
+        logsys::printf("[SCAN] Scanning for TMC2209 drivers...\r\n");
+        logsys::printf("[SCAN] Address | Status | GCONF Register\r\n");
+        logsys::printf("[SCAN] --------|--------|---------------\r\n");
+
+        uint8_t found_count = 0;
+        uint8_t original_addr = transport.getSlave();
+
+        for (uint8_t addr = 0x00; addr <= 0x03; addr++) {
+            transport.setSlave(addr);
+            HAL_Delay(10); // Give time for address change
+
+            // Try to read GCONF register (address 0x00) - always readable
+            uint32_t gconf_value = 0;
+            bool success = transport.regRead(0x00, gconf_value, 1000);
+
+            if (success) {
+                logsys::printf("[SCAN]   0x%02X   |   OK   | 0x%08X\r\n", addr,
+                    static_cast<unsigned int>(gconf_value));
+                found_count++;
+
+                // Check if this looks like a valid TMC2209 GCONF
+                if ((gconf_value & 0xFF) == 0x00
+                    || (gconf_value & 0xFF) == 0x01) {
+                    logsys::printf(
+                        "[SCAN]          | Valid TMC2209 detected!\r\n");
+                }
+            } else {
+                logsys::printf(
+                    "[SCAN]   0x%02X   | NO RSP | -----------\r\n", addr);
+            }
+        }
+
+        // Restore original address
+        transport.setSlave(original_addr);
+
+        logsys::printf(
+            "[SCAN] Scan complete. Found %u responding driver(s).\r\n",
+            found_count);
+        if (found_count == 0) {
+            logsys::printf(
+                "[SCAN] Check wiring: UART_TX, UART_RX, MS1/MS2 pins\r\n");
+        } else {
+            logsys::printf(
+                "[SCAN] Use 'addr <0x00-0x03>' to switch active driver\r\n");
+        }
+
+    } else if (strcmp(token, "addr") == 0) {
+        // Switch active driver address
+        token = strtok(nullptr, " ");
+        if (token) {
+            uint8_t new_addr = static_cast<uint8_t>(strtol(token, nullptr, 16));
+            if (new_addr <= 0x03) {
+                uint8_t old_addr = transport.getSlave();
+                transport.setSlave(new_addr);
+                logsys::printf("[ADDR] Switched from 0x%02X to 0x%02X\r\n",
+                    old_addr, new_addr);
+
+                // Quick test to see if driver responds
+                uint32_t gconf = 0;
+                if (transport.regRead(0x00, gconf, 500)) {
+                    logsys::printf(
+                        "[ADDR] Driver at 0x%02X responds (GCONF=0x%08X)\r\n",
+                        new_addr, static_cast<unsigned int>(gconf));
+                } else {
+                    logsys::printf(
+                        "[ADDR] WARNING: No response from driver at 0x%02X\r\n",
+                        new_addr);
+                }
+            } else {
+                logsys::printf("[ERR] Address must be 0x00-0x03\r\n");
+            }
+        } else {
+            logsys::printf(
+                "[INFO] Current address: 0x%02X\r\n", transport.getSlave());
+            logsys::printf("[INFO] Usage: addr <0x00-0x03>\r\n");
+        }
+
     } else if (strcmp(token, "help") == 0) {
         logsys::printf("Commands:\r\n");
+        logsys::printf(
+            "  scan - Scan for TMC2209 drivers (addresses 0x00-0x03)\r\n");
+        logsys::printf("  addr <0x00-0x03> - Switch active driver address\r\n");
         logsys::printf(
             "  scurve <duration> <peak_speed> [forward/reverse]\r\n");
         logsys::printf(
@@ -334,7 +417,7 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv)
 // Optional: a quick banner on UART2
 static void print_banner()
 {
-    static const char msg[] = "\r\n=== TMC2208 UART-only demo ===\r\n";
+    static const char msg[] = "\r\n=== TMC2209 UART demo ===\r\n";
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, sizeof(msg) - 1, HAL_MAX_DELAY);
 }
 
@@ -358,14 +441,58 @@ int main(void)
     print_banner();
     logsys::printf("[BOOT] System up.\r\n");
 
+    // -------- GPIO Pin Diagnostics --------
+    logsys::printf("[TEST] Checking Half-Duplex GPIO configuration...\r\n");
+    logsys::printf("[TEST] PA9 (UART1_TX Half-Duplex) mode: %s\r\n",
+        (GPIOA->MODER & (3 << (9 * 2))) == (2 << (9 * 2))
+            ? "Alternate Function ✓"
+            : "WRONG MODE!");
+    logsys::printf("[TEST] PA9 Output Type: %s\r\n",
+        (GPIOA->OTYPER & (1 << 9)) ? "Open Drain ✓" : "Push-Pull (WRONG!)");
+    logsys::printf(
+        "[TEST] PA10 should NOT be configured for UART in half-duplex\r\n");
+
+    // Check alternate function registers
+    logsys::printf("[TEST] PA9 AF: %u (should be 7 for UART1)\r\n",
+        (GPIOA->AFR[1] >> ((9 - 8) * 4)) & 0xF);
+
+    // -------- Test UART1 (PA9/PA10) immediately --------
+    logsys::printf("[TEST] Testing UART1 Half-Duplex (PA9 only)...\r\n");
+
+    // Test 1: Direct HAL transmission
+    const char uart1_test[]
+        = "\x05\x00\x00\xFF\xFF\xFF\xFF\xC0"; // Dummy TMC message
+    HAL_StatusTypeDef uart1_status = HAL_UART_Transmit(
+        &huart1, (uint8_t*)uart1_test, sizeof(uart1_test) - 1, 1000);
+
+    if (uart1_status == HAL_OK) {
+        logsys::printf(
+            "[TEST] UART1 HAL TX successful - check PA9 for activity\r\n");
+    } else {
+        logsys::printf(
+            "[ERROR] UART1 HAL TX failed! Status: %d\r\n", uart1_status);
+    }
+
+    // Test 2: Multiple bytes to make it visible on logic analyzer
+    logsys::printf("[TEST] Sending multiple test bytes on PA9...\r\n");
+    for (int i = 0; i < 5; i++) {
+        uint8_t test_byte = 0x55; // Alternating pattern 01010101
+        HAL_UART_Transmit(&huart1, &test_byte, 1, 100);
+        HAL_Delay(10);
+    }
+    logsys::printf("[TEST] Test pattern sent - should see 5 bytes on PA9\r\n");
+
+    // Give time to observe on logic analyzer
+    HAL_Delay(100);
+
     // -------- Bridge → Transport → Device --------
     UART_Bridge bridge(&huart1); // wraps half-duplex TX/RX + hex dump
-    TMC2208_UART_Transport::Config tcfg {};
+    TMC22xx_UART_Transport::Config tcfg {};
     tcfg.retries = 1; // retry a couple times on CRC/short RX
     tcfg.read_timeout_us = 4000;
     tcfg.verify_write = false; // set true if you want RW readback verify
-    TMC2208_UART_Transport bus(&bridge, /*slave*/ 0x00, tcfg);
-    TMC2208::Device drv(bus);
+    TMC22xx_UART_Transport bus(&bridge, /*slave*/ 0x00, tcfg);
+    TMC2208::Device drv(bus); // TMC2208 API compatible with TMC2209 hardware
 
     // -------- Minimal driver configuration --------
     // For responsive torque (recommended for balance/quick moves), use
@@ -392,11 +519,27 @@ int main(void)
     drv.ihold_irun(/*IHOLD=*/8, /*IRUN=*/24, /*IHOLDDELAY=*/8);
     drv.tpowerdown(20); // drop to IHOLD after 20*~12ms idle
 
-    logsys::printf("[INFO] TMC2208 configured.\r\n");
+    logsys::printf("[INFO] TMC2209 configured.\r\n");
+
+    // NOTE: TMC2209 supports UART addressing (used for multi-driver setups)
+    // Current config uses default address 0x00 for single driver operation
+
+    // -------- Test TMC UART Communication --------
+    logsys::printf("[TEST] Testing TMC UART communication...\r\n");
+    uint32_t gconf_test = 0;
+    bool comm_test = bus.regRead(0x00, gconf_test, 2000);
+    if (comm_test) {
+        logsys::printf("[TEST] TMC communication OK! GCONF=0x%08X\r\n",
+            static_cast<unsigned int>(gconf_test));
+    } else {
+        logsys::printf(
+            "[ERROR] TMC communication FAILED! Check PA9/PA10 wiring\r\n");
+        logsys::printf("[ERROR] This should generate UART activity on PA9\r\n");
+    }
 
     // -------- Motion: S-curve using VACTUAL (UART-only; no STEP/DIR) --------
     motion::MotionProfile mp(drv);
-    // IMPORTANT: this clock is the TMC2208's clock, not MCU 64 MHz.
+    // IMPORTANT: this clock is the TMC2209's clock, not MCU 64 MHz.
     // Keep 12 MHz unless you physically feed an external CLK into the driver.
     mp.setClockHz(12'000'000.0f);
 
@@ -406,7 +549,7 @@ int main(void)
     while (1) {
         // Handle incoming commands
         handle_uart_input();
-        process_command(mp, drv);
+        process_command(mp, drv, bus);
 
         // Blink LED to show system is alive
         static uint32_t last_blink = 0;
