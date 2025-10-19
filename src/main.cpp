@@ -3,6 +3,8 @@
 #include "logger.hpp"
 #include "motion_profile.hpp"
 #include "uart_bridge.hpp"
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -18,6 +20,21 @@ namespace
 {
 constexpr uint32_t kBlinkIntervalMs = 1000U;
 constexpr char kHelloMsg[] = "\nHello World!\r\n\n";
+constexpr std::array<uint8_t, 2> kDriverAddresses = { 0x00, 0x01 };
+uint8_t g_active_driver = kDriverAddresses.front();
+
+bool set_vactual_all(
+    TMC2208::Device& drv, TMC22xx_UART_Transport& bus, int32_t vactual)
+{
+    bool ok = true;
+    uint8_t saved_addr = bus.getSlave();
+    for (uint8_t addr : kDriverAddresses) {
+        bus.setSlave(addr);
+        ok &= drv.vactual(vactual);
+    }
+    bus.setSlave(saved_addr);
+    return ok;
+}
 
 void send_uart2(const char* msg, size_t len)
 {
@@ -135,6 +152,50 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
         logsys::printf(
             "[TEST] Test done. Motor should have moved slightly.\r\n");
 
+    } else if (strcmp(token, "testboth") == 0) {
+        logsys::printf(
+            "[TEST] Running simultaneous S-curve on all drivers...\r\n");
+        uint8_t saved_addr = transport.getSlave();
+
+        const float duration_s = 1.0f;
+        const float peak_usteps = 5000.0f;
+        const uint32_t update_ms = 10;
+        const uint32_t steps
+            = static_cast<uint32_t>((duration_s * 1000.0f) / update_ms);
+
+        if (steps == 0) {
+            logsys::printf("[TEST] Invalid step count.\r\n");
+        } else {
+            for (uint32_t i = 0; i < steps; ++i) {
+                const float x
+                    = static_cast<float>(i) / static_cast<float>(steps);
+                const float x2 = (x <= 0.5f) ? (x * 2.f) : ((1.f - x) * 2.f);
+                const float v_mag
+                    = peak_usteps * 0.5f * (1.f - std::cos(3.14159265f * x2));
+                const int32_t vact = mp.vactualFromUSteps(v_mag);
+
+                for (uint8_t addr : kDriverAddresses) {
+                    transport.setSlave(addr);
+                    if (!drv.vactual(vact)) {
+                        logsys::printf("[TEST] Failed to set vactual for "
+                                       "driver 0x%02X\r\n",
+                            addr);
+                    }
+                }
+                HAL_Delay(update_ms);
+            }
+
+            // Stop all drivers
+            for (uint8_t addr : kDriverAddresses) {
+                transport.setSlave(addr);
+                (void)drv.vactual(0);
+            }
+            logsys::printf("[TEST] Simultaneous test finished.\r\n");
+        }
+
+        transport.setSlave(saved_addr);
+        g_active_driver = saved_addr;
+
     } else if (strcmp(token, "current") == 0) {
         // Show current settings (configured values, not read from chip)
         logsys::printf("[INFO] Configured: IHOLD=8, IRUN=24, IHOLDDELAY=8\r\n");
@@ -174,7 +235,7 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
 
         // Use a much lower speed to avoid motor stalling/noise
         const float spin_speed
-            = 8000.0f; // microsteps/s - reduced for reliability
+            = 20000.0f; // microsteps/s - reduced for reliability
         current_spin_speed = spin_speed; // Store for deceleration
 
         logsys::printf(
@@ -192,9 +253,10 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
                 (dir == motion::Direction::Forward) ? current_speed
                                                     : -current_speed);
 
-            if (!drv.vactual(vactual)) {
+            if (!set_vactual_all(drv, transport, vactual)) {
                 logsys::printf("[ERR] Failed to set speed step %d\r\n", i);
                 continuous_spinning = false;
+                set_vactual_all(drv, transport, 0);
                 return;
             }
             HAL_Delay(step_delay_ms);
@@ -285,7 +347,7 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
                         ? decel_speed
                         : -decel_speed);
 
-                if (!drv.vactual(vactual)) {
+                if (!set_vactual_all(drv, transport, vactual)) {
                     logsys::printf("[ERR] Failed to set decel step %d\r\n", i);
                     break;
                 }
@@ -293,7 +355,7 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
             }
 
             // Final stop
-            drv.vactual(0);
+            set_vactual_all(drv, transport, 0);
             logsys::printf("[SPIN] Continuous spinning stopped smoothly.\r\n");
         } else {
             mp.stop();
@@ -315,7 +377,7 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
 
             // Try to read GCONF register (address 0x00) - always readable
             uint32_t gconf_value = 0;
-            bool success = transport.regRead(0x00, gconf_value, 1000);
+            bool success = transport.regRead(0x00, gconf_value, 5000);
 
             if (success) {
                 logsys::printf("[SCAN]   0x%02X   |   OK   | 0x%08X\r\n", addr,
@@ -341,8 +403,19 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
             "[SCAN] Scan complete. Found %u responding driver(s).\r\n",
             found_count);
         if (found_count == 0) {
+            logsys::printf("[ERROR] No TMC2209 drivers responding!\r\n");
+            logsys::printf("[CHECK] Required connections for UART mode:\r\n");
             logsys::printf(
-                "[SCAN] Check wiring: UART_TX, UART_RX, MS1/MS2 pins\r\n");
+                "        - PA9 -> USART (via 1k resistor) ✓ WORKING\r\n");
+            logsys::printf("        - MS1 -> GND ✓ CONFIRMED\r\n");
+            logsys::printf("        - MS2 -> GND ✓ CONFIRMED\r\n");
+            logsys::printf("        - EN -> GND ✓ CONFIRMED\r\n");
+            logsys::printf(
+                "        - PDN_UART -> VIO (3.3V) ← CHECK THIS!\r\n");
+            logsys::printf("        - VIO -> 3.3V power supply\r\n");
+            logsys::printf("        - VM -> 12V motor supply\r\n");
+            logsys::printf("        - All GND connections solid\r\n");
+            logsys::printf("[HINT] PDN_UART must be HIGH for UART mode!\r\n");
         } else {
             logsys::printf(
                 "[SCAN] Use 'addr <0x00-0x03>' to switch active driver\r\n");
@@ -356,6 +429,7 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
             if (new_addr <= 0x03) {
                 uint8_t old_addr = transport.getSlave();
                 transport.setSlave(new_addr);
+                g_active_driver = new_addr;
                 logsys::printf("[ADDR] Switched from 0x%02X to 0x%02X\r\n",
                     old_addr, new_addr);
 
@@ -390,6 +464,8 @@ void process_command(motion::MotionProfile& mp, TMC2208::Device& drv,
             "  triangle <duration> <peak_speed> [forward/reverse]\r\n");
         logsys::printf("  spin [forward/reverse] - Continuous smooth spinning "
                        "(8k usteps/s)\r\n");
+        logsys::printf(
+            "  testboth - Run short simultaneous spin on all drivers\r\n");
         logsys::printf("  turbo-spin [forward/reverse] - MAXIMUM speed "
                        "spinning (40k usteps/s)\r\n");
         logsys::printf("  test - Quick movement test\r\n");
@@ -441,47 +517,6 @@ int main(void)
     print_banner();
     logsys::printf("[BOOT] System up.\r\n");
 
-    // -------- GPIO Pin Diagnostics --------
-    logsys::printf("[TEST] Checking Half-Duplex GPIO configuration...\r\n");
-    logsys::printf("[TEST] PA9 (UART1_TX Half-Duplex) mode: %s\r\n",
-        (GPIOA->MODER & (3 << (9 * 2))) == (2 << (9 * 2))
-            ? "Alternate Function ✓"
-            : "WRONG MODE!");
-    logsys::printf("[TEST] PA9 Output Type: %s\r\n",
-        (GPIOA->OTYPER & (1 << 9)) ? "Open Drain ✓" : "Push-Pull (WRONG!)");
-    logsys::printf(
-        "[TEST] PA10 should NOT be configured for UART in half-duplex\r\n");
-
-    // Check alternate function registers
-    logsys::printf("[TEST] PA9 AF: %u (should be 7 for UART1)\r\n",
-        (GPIOA->AFR[1] >> ((9 - 8) * 4)) & 0xF);
-
-    // -------- Test UART1 (PA9/PA10) immediately --------
-    logsys::printf("[TEST] Testing UART1 Half-Duplex (PA9 only)...\r\n");
-
-    // Test 1: Direct HAL transmission
-    const char uart1_test[]
-        = "\x05\x00\x00\xFF\xFF\xFF\xFF\xC0"; // Dummy TMC message
-    HAL_StatusTypeDef uart1_status = HAL_UART_Transmit(
-        &huart1, (uint8_t*)uart1_test, sizeof(uart1_test) - 1, 1000);
-
-    if (uart1_status == HAL_OK) {
-        logsys::printf(
-            "[TEST] UART1 HAL TX successful - check PA9 for activity\r\n");
-    } else {
-        logsys::printf(
-            "[ERROR] UART1 HAL TX failed! Status: %d\r\n", uart1_status);
-    }
-
-    // Test 2: Multiple bytes to make it visible on logic analyzer
-    logsys::printf("[TEST] Sending multiple test bytes on PA9...\r\n");
-    for (int i = 0; i < 5; i++) {
-        uint8_t test_byte = 0x55; // Alternating pattern 01010101
-        HAL_UART_Transmit(&huart1, &test_byte, 1, 100);
-        HAL_Delay(10);
-    }
-    logsys::printf("[TEST] Test pattern sent - should see 5 bytes on PA9\r\n");
-
     // Give time to observe on logic analyzer
     HAL_Delay(100);
 
@@ -492,37 +527,50 @@ int main(void)
     tcfg.read_timeout_us = 4000;
     tcfg.verify_write = false; // set true if you want RW readback verify
     TMC22xx_UART_Transport bus(&bridge, /*slave*/ 0x00, tcfg);
+
+    // Send autobaud burst before any real commands to auto-config the drivers.
+    bus.autoBaudWait();
+
     TMC2208::Device drv(bus); // TMC2208 API compatible with TMC2209 hardware
 
     // -------- Minimal driver configuration --------
-    // For responsive torque (recommended for balance/quick moves), use
-    // SpreadCycle:
-    drv.gconf_or(TMC2208::gconf::EN_SPREADCYCLE);
-    drv.chop_set_mres(TMC2208::chopconf::_16);
-    drv.chop_set_toff(3);
-    drv.chop_set_hstrt(5);
-    drv.chop_set_hend(7);
-    drv.chop_set_vsense(false); // VSENSE=0 → higher full-scale current
+    for (uint8_t addr : kDriverAddresses) {
+        bus.setSlave(addr);
+        logsys::printf("[INIT] Configuring driver at 0x%02X...\r\n", addr);
 
-    // If you want ultra-quiet bench tests instead, comment the block above and
-    // enable StealthChop: drv.gconf_andc(TMC2208::gconf::EN_SPREADCYCLE);
-    // drv.chop_set_mres(TMC2208::chopconf::_16);
-    // drv.chop_set(TMC2208::chopconf::INTPOL);
-    // drv.pwm_set_autoscale(true);
-    // drv.pwm_set_autograd(true);
-    // drv.pwm_set_freq(TMC2208::pwmconf::FREQ_12);
-    // drv.pwm_set_ofs(0x10);
-    // drv.pwm_set_grad(0x40);
-    // drv.tpwmthrs(1000);
+        bool ok = true;
 
-    // Current limits (tune to your motor + Rsense)
-    drv.ihold_irun(/*IHOLD=*/8, /*IRUN=*/24, /*IHOLDDELAY=*/8);
-    drv.tpowerdown(20); // drop to IHOLD after 20*~12ms idle
+        constexpr uint32_t kGConfVal = TMC2208::gconf::PDN_DISABLE
+            | TMC2208::gconf::MSTEP_REG_SELECT;
+        ok &= bus.regWrite(TMC2208::GCONF, kGConfVal);
+        ok &= drv.chop_set_mres(TMC2208::chopconf::_16);
+        ok &= drv.chop_set_toff(0);
+        ok &= drv.chop_set_hstrt(0);
+        ok &= drv.chop_set_hend(0);
+        ok &= drv.chop_set_vsense(false); // VSENSE=0 → higher full-scale current
+        ok &= drv.ihold_irun(/*IHOLD=*/8, /*IRUN=*/12, /*IHOLDDELAY=*/8);
+        ok &= drv.tpowerdown(20); // drop to IHOLD after 20*~12ms idle
+        ok &= drv.pwm_set_autoscale(true);
+        ok &= drv.pwm_set_autograd(true);
+        ok &= drv.pwm_set_freq(TMC2208::pwmconf::FREQ_12);
+        ok &= drv.pwm_set_ofs(0x20);
+        ok &= drv.pwm_set_grad(0x20);
+        ok &= drv.tpwmthrs(0); // stay in StealthChop across full speed range
 
-    logsys::printf("[INFO] TMC2209 configured.\r\n");
+        if (ok) {
+            logsys::printf("[INIT] Driver 0x%02X configured.\r\n", addr);
+        } else {
+            logsys::printf(
+                "[WARN] Driver 0x%02X configuration reported an error.\r\n",
+                addr);
+        }
+    }
 
-    // NOTE: TMC2209 supports UART addressing (used for multi-driver setups)
-    // Current config uses default address 0x00 for single driver operation
+    // Default to the first driver (0x00) for subsequent commands.
+    bus.setSlave(kDriverAddresses.front());
+    g_active_driver = kDriverAddresses.front();
+    logsys::printf(
+        "[INFO] Active driver set to 0x%02X\r\n", kDriverAddresses.front());
 
     // -------- Test TMC UART Communication --------
     logsys::printf("[TEST] Testing TMC UART communication...\r\n");

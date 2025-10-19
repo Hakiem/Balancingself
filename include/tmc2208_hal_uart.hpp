@@ -63,6 +63,14 @@ public:
     void setConfig(const Config& cfg) { cfg_ = cfg; }
     const Config& getConfig() const { return cfg_; }
 
+    // Send an autobaud burst before any real commands
+    void autoBaudWait()
+    {
+        uint8_t zero[8] = { 0 };
+        bridge_->transmit(zero, sizeof(zero));
+        HAL_Delay(2); // wait 2ms for line to settle
+    }
+
     // Read 32-bit register (7-bit addr, raw) -> fills 'out' on success
     bool regRead(uint8_t reg, uint32_t& out, uint32_t timeout_us_override = 0)
     {
