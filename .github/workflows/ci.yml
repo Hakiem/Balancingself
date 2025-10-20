@@ -38,13 +38,13 @@ jobs:
             ${{ runner.os }}-pio-
 
       - name: Run native unit tests
-        run: pio test -e native --junit-output test-results-native.xml
+        run: pio test -e native --junit-output-path test-results
 
       - name: Upload test report
         uses: actions/upload-artifact@v4
         with:
           name: test-report-native
-          path: test-results-native.xml
+          path: test-results
 
       - name: Build firmware (ELF)
         run: pio run -e nucleo_f303k8_mbed
