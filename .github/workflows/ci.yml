@@ -43,11 +43,14 @@ jobs:
       - name: Build firmware (ELF)
         run: pio run -e nucleo_f303k8_mbed
 
+      - name: Rename firmware with commit SHA
+        run: mv .pio/build/nucleo_f303k8_mbed/firmware.elf .pio/build/nucleo_f303k8_mbed/firmware-${GITHUB_SHA}.elf
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-elf
-          path: .pio/build/nucleo_f303k8_mbed/firmware.elf
+          name: firmware-elf-${{ github.sha }}
+          path: .pio/build/nucleo_f303k8_mbed/firmware-${{ github.sha }}.elf
 
   release:
     needs: build-and-test
@@ -58,12 +61,13 @@ jobs:
       - name: Download firmware artifact
         uses: actions/download-artifact@v4
         with:
-          name: firmware-elf
+          pattern: firmware-elf-${{ github.sha }}
           path: build-output
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: build-output/firmware.elf
+          files: build-output/firmware-${{ github.sha }}.elf
+          name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
