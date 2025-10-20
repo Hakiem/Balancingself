@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Update PlatformIO platforms/libs
+        run: pio update
+
+      # optional, speeds up repeated runs by caching ~/.platformio and .pio
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: Run native unit tests
+        run: pio test -e native
+
+      - name: Build firmware (bin/elf/hex)
+        run: |
+          pio run -e nucleo_f303k8_mbed
+          pio run -e nucleo_f303k8_mbed --target elf
+          pio run -e nucleo_f303k8_mbed --target hex
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            .pio/build/nucleo_f303k8_mbed/firmware.bin
+            .pio/build/nucleo_f303k8_mbed/firmware.elf
+            .pio/build/nucleo_f303k8_mbed/firmware.hex
