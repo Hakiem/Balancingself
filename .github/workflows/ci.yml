@@ -44,7 +44,7 @@ jobs:
       - name: Run native unit tests
         run: |
           mkdir -p test-results
-          pio test -e native --junit-output-path test-results --junit-output-name native
+          pio test -e native --junit-output-path test-results
 
       - name: Publish unit test results
         uses: EnricoMi/publish-unit-test-result-action@v2
