@@ -1,332 +1,327 @@
 #pragma once
+
+#include "motion_math.hpp"
+#include "motion_types.hpp"
+#ifdef UNIT_TEST
+#include "hal_stubs.hpp"
+#else
 #include "stm32f3xx_hal.h"
-#include "tmc2208_hal_uart.hpp"
+#endif
+#include "tmc2130_motor.hpp"
 #include <cmath>
 #include <cstdint>
+#include <math.h>
 
-// Header-only motion helper for TMC2209 using UART-only control (VACTUAL).
-// Provides:
-//   - Direction enum
-//   - VACTUAL <-> microsteps/s conversion
-//   - Smooth S-curve (cosine ease-in/ease-out) profile runner
-//   - Triangular profile (linear acceleration/deceleration)
-//   - Trapezoidal profile (accel → constant → decel)
-//   - Exponential profile (natural acceleration curve)
-//   - Sinusoidal profile (pure sine wave - very smooth)
-//   - Constant velocity profile (rectangular)
-// All functions return 'bool' to indicate whether UART writes succeeded.
-namespace motion
-{
-enum class Direction : int { Reverse = -1, Forward = +1 };
+namespace motion {
 
+/**
+ * @brief SPI-only motion helper that drives TMC2130 in direct mode (XDIRECT).
+ *
+ * The class synthesises sine/cosine coil currents for the requested velocity
+ * profile and streams them to the driver via @ref tmc2130::Motor. No STEP/DIR
+ * pins are used; all motion is produced through SPI writes to @ref Reg::XDIRECT.
+ */
 class MotionProfile final
 {
 public:
-    explicit MotionProfile(TMC2208::Device& drv, float fclk_hz = 12'000'000.0f)
-        : drv_(drv)
-        , fclk_hz_(fclk_hz)
+    /**
+     * @brief Construct the profile helper.
+     *
+     * @param motor Reference to an initialised TMC2130 motor wrapper. Make sure
+     *              GCONF.direct_mode is enabled before issuing movement.
+     * @param timer Optional hardware timer providing microsecond timing for
+     *              microstep updates. When nullptr the helper falls back to
+     *              coarse millisecond delays.
+     */
+    explicit MotionProfile(
+        tmc2130::Motor& motor, TIM_HandleTypeDef* timer = nullptr)
+        : motor_(motor)
+        , timer_(timer)
     {
+        if (timer_) {
+            HAL_TIM_Base_Start(timer_);
+            timer_started_ = true;
+        }
+        recalcPhase();
     }
 
-    // Configure the internal/external clock value (Hz) used for VACTUAL
-    // scaling.
-    void setClockHz(float fclk_hz) noexcept { fclk_hz_ = fclk_hz; }
-    float clockHz() const noexcept { return fclk_hz_; }
-
-    // --- Conversions ---------------------------------------------------------
-
-    // Convert desired microsteps per second -> VACTUAL (signed 24-bit).
-    // VACTUAL LSB corresponds to fclk/2^24 µsteps/s.
-    int32_t vactualFromUSteps(float usteps_per_s) const noexcept
+    /**
+     * @brief Set the number of microsteps used to complete one electrical revolution.
+     */
+    void setMicrostepResolution(uint16_t microsteps)
     {
-        const float lsb_hz = fclk_hz_ / float(1u << 24);
-        float v = usteps_per_s / lsb_hz;
-
-        // Clamp to signed 24-bit range ([-2^23, 2^23-1])
-        constexpr float VMAX = 8'388'607.0f; // 2^23 - 1
-        constexpr float VMIN = -8'388'608.0f; // -2^23
-        if (v > VMAX)
-            v = VMAX;
-        if (v < VMIN)
-            v = VMIN;
-
-        // Round to nearest integer (symmetric)
-        return static_cast<int32_t>(v >= 0.f ? (v + 0.5f) : (v - 0.5f));
+        if (microsteps == 0)
+            microsteps = 256;
+        microsteps_per_cycle_ = microsteps;
+        if (microstep_index_ >= microsteps_per_cycle_)
+            microstep_index_ %= microsteps_per_cycle_;
+        recalcPhase();
     }
 
-    // Convert VACTUAL back to microsteps per second.
-    float ustepsFromVactual(int32_t vactual) const noexcept
+    /**
+     * @brief Adjust the sine wave amplitude (0…255).
+     */
+    void setAmplitude(float amplitude)
     {
-        const float lsb_hz = fclk_hz_ / float(1u << 24);
-        return static_cast<float>(vactual) * lsb_hz;
+        if (amplitude < 0.f)
+            amplitude = 0.f;
+        if (amplitude > 255.f)
+            amplitude = 255.f;
+        amplitude_ = amplitude;
     }
 
-    // --- Profiles ------------------------------------------------------------
+    /**
+     * @brief Access the underlying motor helper.
+     */
+    tmc2130::Motor& driver() { return motor_; }
+    const tmc2130::Motor& driver() const { return motor_; }
 
-    // Smooth S-curve (cosine ease-in/out) velocity profile.
-    // duration_s       : total duration of the profile (s)
-    // peak_usteps_s    : peak speed magnitude (µsteps/s)
-    // dir              : motion direction (Forward/Reverse)
-    // update_period_ms : how often to update VACTUAL; lower is smoother (5–10
-    // ms typical) Returns false if any UART write fails; otherwise true.
     bool runSCurve(float duration_s, float peak_usteps_s,
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
     {
-        if (duration_s <= 0.f || update_period_ms == 0u)
-            return false;
-
-        const uint32_t steps = static_cast<uint32_t>(
-            (duration_s * 1000.0f) / static_cast<float>(update_period_ms));
-        if (steps == 0u)
-            return false;
-
-        const float dir_sign = (dir == Direction::Forward) ? +1.f : -1.f;
-
-        // Cosine-eased triangle on velocity magnitude: rise → fall
-        for (uint32_t i = 0; i < steps; ++i) {
-            const float x
-                = static_cast<float>(i) / static_cast<float>(steps); // 0..1
-            const float x2
-                = (x <= 0.5f) ? (x * 2.f) : ((1.f - x) * 2.f); // 0..1..0
-            const float v_mag
-                = peak_usteps_s * 0.5f * (1.f - std::cos(3.14159265f * x2));
-            const float v_signed = dir_sign * v_mag;
-
-            const int32_t vact = vactualFromUSteps(v_signed);
-            if (!drv_.vactual(vact))
-                return false;
-
-            HAL_Delay(update_period_ms);
-        }
-
-        // Clean stop
-        (void)drv_.vactual(0);
-        return true;
+        return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
+            [](float t) {
+                const float t2 = (t <= 0.5f) ? (t * 2.f) : ((1.f - t) * 2.f);
+                return 0.5f * (1.f - cosf(kPi * t2));
+            });
     }
 
-    // Simple linear triangular profile (optional alternative).
-    // Accelerates linearly to peak at t=duration/2, then linearly decelerates
-    // to 0.
     bool runTriangular(float duration_s, float peak_usteps_s,
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
     {
-        if (duration_s <= 0.f || update_period_ms == 0u)
-            return false;
-
-        const uint32_t steps = static_cast<uint32_t>(
-            (duration_s * 1000.0f) / static_cast<float>(update_period_ms));
-        if (steps == 0u)
-            return false;
-
-        const float dir_sign = (dir == Direction::Forward) ? +1.f : -1.f;
-
-        for (uint32_t i = 0; i < steps; ++i) {
-            const float x
-                = static_cast<float>(i) / static_cast<float>(steps); // 0..1
-            const float tri
-                = (x <= 0.5f) ? (x * 2.f) : (2.f - 2.f * x); // 0..1..0
-            const float v_signed = dir_sign * (peak_usteps_s * tri);
-
-            const int32_t vact = vactualFromUSteps(v_signed);
-            if (!drv_.vactual(vact))
-                return false;
-
-            HAL_Delay(update_period_ms);
-        }
-
-        (void)drv_.vactual(0);
-        return true;
+        return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
+            [](float t) {
+                return (t <= 0.5f) ? (t * 2.f) : (2.f - 2.f * t);
+            });
     }
 
-    // Immediate stop helper.
-    bool stop() { return drv_.vactual(0); }
-
-    // Trapezoidal profile: accel → constant velocity → decel
-    // accel_time_s     : time to reach peak speed (s)
-    // const_time_s     : time at constant peak speed (s)
-    // decel_time_s     : time to decelerate from peak (s)
-    // peak_usteps_s    : peak speed magnitude (µsteps/s)
-    // dir              : motion direction
-    // update_period_ms : update rate
     bool runTrapezoidal(float accel_time_s, float const_time_s,
         float decel_time_s, float peak_usteps_s,
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
     {
-        if (accel_time_s <= 0.f || const_time_s < 0.f || decel_time_s <= 0.f
+        if (accel_time_s < 0.f || const_time_s < 0.f || decel_time_s < 0.f
             || update_period_ms == 0u)
             return false;
 
-        const float dir_sign = (dir == Direction::Forward) ? +1.f : -1.f;
+        if (!runRamp(accel_time_s, peak_usteps_s, dir, update_period_ms, true))
+            return false;
 
-        // Phase 1: Linear acceleration
-        const uint32_t accel_steps = static_cast<uint32_t>(
-            (accel_time_s * 1000.0f) / static_cast<float>(update_period_ms));
+        if (const_time_s > 0.f
+            && !runProfile(const_time_s, peak_usteps_s, dir, update_period_ms,
+                [](float) { return 1.f; }))
+            return false;
 
-        for (uint32_t i = 0; i < accel_steps; ++i) {
-            const float progress
-                = static_cast<float>(i) / static_cast<float>(accel_steps);
-            const float v_signed = dir_sign * (peak_usteps_s * progress);
+        if (!runRamp(decel_time_s, peak_usteps_s, dir, update_period_ms, false))
+            return false;
 
-            const int32_t vact = vactualFromUSteps(v_signed);
-            if (!drv_.vactual(vact))
-                return false;
-            HAL_Delay(update_period_ms);
-        }
-
-        // Phase 2: Constant velocity
-        if (const_time_s > 0.f) {
-            const uint32_t const_steps
-                = static_cast<uint32_t>((const_time_s * 1000.0f)
-                    / static_cast<float>(update_period_ms));
-            const int32_t const_vact
-                = vactualFromUSteps(dir_sign * peak_usteps_s);
-
-            for (uint32_t i = 0; i < const_steps; ++i) {
-                if (!drv_.vactual(const_vact))
-                    return false;
-                HAL_Delay(update_period_ms);
-            }
-        }
-
-        // Phase 3: Linear deceleration
-        const uint32_t decel_steps = static_cast<uint32_t>(
-            (decel_time_s * 1000.0f) / static_cast<float>(update_period_ms));
-
-        for (uint32_t i = 0; i < decel_steps; ++i) {
-            const float progress = 1.0f
-                - (static_cast<float>(i) / static_cast<float>(decel_steps));
-            const float v_signed = dir_sign * (peak_usteps_s * progress);
-
-            const int32_t vact = vactualFromUSteps(v_signed);
-            if (!drv_.vactual(vact))
-                return false;
-            HAL_Delay(update_period_ms);
-        }
-
-        // Clean stop
-        (void)drv_.vactual(0);
-        return true;
+        return stop();
     }
 
-    // Exponential profile: natural acceleration curve
-    // duration_s       : total duration of the profile (s)
-    // peak_usteps_s    : peak speed magnitude (µsteps/s)
-    // steepness        : curve steepness (2.0 = gentle, 6.0 = sharp)
-    // dir              : motion direction
-    // update_period_ms : update rate
     bool runExponential(float duration_s, float peak_usteps_s,
         float steepness = 4.0f, Direction dir = Direction::Forward,
         uint32_t update_period_ms = 10)
     {
-        if (duration_s <= 0.f || steepness <= 0.f || update_period_ms == 0u)
+        if (steepness <= 0.f)
             return false;
-
-        const uint32_t steps = static_cast<uint32_t>(
-            (duration_s * 1000.0f) / static_cast<float>(update_period_ms));
-        if (steps == 0u)
-            return false;
-
-        const float dir_sign = (dir == Direction::Forward) ? +1.f : -1.f;
-
-        for (uint32_t i = 0; i < steps; ++i) {
-            const float x
-                = static_cast<float>(i) / static_cast<float>(steps); // 0..1
-
-            // Exponential ease-in-out curve
-            float exp_curve;
-            if (x <= 0.5f) {
-                // Ease in: exponential acceleration
-                const float t = x * 2.0f; // 0..1
-                exp_curve = (std::exp(steepness * t) - 1.0f)
-                    / (std::exp(steepness) - 1.0f);
-                exp_curve *= 0.5f; // Scale to 0..0.5
-            } else {
-                // Ease out: exponential deceleration
-                const float t = (1.0f - x) * 2.0f; // 1..0
-                exp_curve = (std::exp(steepness * t) - 1.0f)
-                    / (std::exp(steepness) - 1.0f);
-                exp_curve
-                    = 1.0f - (exp_curve * 0.5f); // Scale to 0.5..1, then invert
-            }
-
-            const float v_signed = dir_sign * (peak_usteps_s * exp_curve);
-            const int32_t vact = vactualFromUSteps(v_signed);
-            if (!drv_.vactual(vact))
-                return false;
-
-            HAL_Delay(update_period_ms);
-        }
-
-        // Clean stop
-        (void)drv_.vactual(0);
-        return true;
+        const float denom = expf(steepness) - 1.0f;
+        return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
+            [steepness, denom](float t) {
+                if (t <= 0.5f) {
+                    const float x = t * 2.0f;
+                    return (expf(steepness * x) - 1.0f) / denom * 0.5f;
+                }
+                const float x = (1.0f - t) * 2.0f;
+                return 1.0f - (expf(steepness * x) - 1.0f) / denom * 0.5f;
+            });
     }
 
-    // Constant velocity profile: immediate jump to speed, hold, then stop
-    // duration_s       : time at constant speed (s)
-    // usteps_s         : constant speed (µsteps/s)
-    // dir              : motion direction
     bool runConstantVelocity(
         float duration_s, float usteps_s, Direction dir = Direction::Forward)
     {
         if (duration_s <= 0.f)
             return false;
 
-        const float dir_sign = (dir == Direction::Forward) ? +1.f : -1.f;
-        const int32_t vact = vactualFromUSteps(dir_sign * usteps_s);
-
-        // Set velocity immediately
-        if (!drv_.vactual(vact))
-            return false;
-
-        // Hold for duration
-        HAL_Delay(static_cast<uint32_t>(duration_s * 1000.0f));
-
-        // Stop
-        return drv_.vactual(0);
+        constexpr uint32_t period_ms = 10;
+        return runProfile(duration_s, usteps_s, dir, period_ms,
+            [](float) { return 1.f; });
     }
 
-    // Sinusoidal profile: pure sine wave acceleration (very smooth)
-    // duration_s       : total duration of the profile (s)
-    // peak_usteps_s    : peak speed magnitude (µsteps/s)
-    // dir              : motion direction
-    // update_period_ms : update rate
     bool runSinusoidal(float duration_s, float peak_usteps_s,
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
+    {
+        return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
+            [](float t) { return sinf(kPi * t); });
+    }
+
+    /**
+     * @brief Immediately halt motion (no additional SPI writes).
+     */
+    bool stop()
+    {
+        fractional_steps_ = 0.f;
+        return motor_.write(tmc2130::Reg::XDIRECT, 0);
+    }
+
+private:
+    template <typename Curve>
+    bool runProfile(float duration_s, float peak_usteps_s, Direction dir,
+        uint32_t update_period_ms, Curve curve)
     {
         if (duration_s <= 0.f || update_period_ms == 0u)
             return false;
 
-        const uint32_t steps = static_cast<uint32_t>(
-            (duration_s * 1000.0f) / static_cast<float>(update_period_ms));
-        if (steps == 0u)
+        const uint32_t segments
+            = static_cast<uint32_t>((duration_s * 1000.0f) / update_period_ms);
+        if (segments == 0u)
             return false;
 
-        const float dir_sign = (dir == Direction::Forward) ? +1.f : -1.f;
-        const float pi = 3.14159265f;
-
-        // Pure sine wave profile: 0 → peak → 0
-        for (uint32_t i = 0; i < steps; ++i) {
-            const float x
-                = static_cast<float>(i) / static_cast<float>(steps); // 0..1
-            const float sine_value
-                = std::sin(pi * x); // 0..1..0 (sine wave from 0 to π)
-            const float v_signed = dir_sign * (peak_usteps_s * sine_value);
-
-            const int32_t vact = vactualFromUSteps(v_signed);
-            if (!drv_.vactual(vact))
+        for (uint32_t i = 0; i < segments; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(segments);
+            float magnitude = peak_usteps_s * curve(t);
+            if (magnitude < 0.f)
+                magnitude = 0.f;
+            if (!applyVelocity(dir, magnitude, update_period_ms))
                 return false;
+        }
+        return stop();
+    }
 
-            HAL_Delay(update_period_ms);
+    bool runRamp(float duration_s, float peak_usteps_s, Direction dir,
+        uint32_t update_period_ms, bool accelerating)
+    {
+        return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
+            [accelerating](float t) {
+                return accelerating ? t : (1.0f - t);
+            });
+    }
+
+    bool applyVelocity(
+        Direction dir, float usteps_per_s, uint32_t update_period_ms)
+    {
+        if (update_period_ms == 0u)
+            return false;
+        if (usteps_per_s <= 0.f) {
+            fractional_steps_ = 0.f;
+            return true;
         }
 
-        // Clean stop
-        (void)drv_.vactual(0);
+        const float interval_s
+            = static_cast<float>(update_period_ms) * 0.001f;
+        float desired_steps = usteps_per_s * interval_s + fractional_steps_;
+        const uint32_t whole_steps = static_cast<uint32_t>(desired_steps);
+        fractional_steps_ = desired_steps - static_cast<float>(whole_steps);
+
+        return emitMicrosteps(dir, whole_steps, usteps_per_s);
+    }
+
+    bool emitMicrosteps(Direction dir, uint32_t steps, float usteps_per_s)
+    {
+        if (steps == 0)
+            return true;
+
+        const float period_us_f = 1'000'000.0f / usteps_per_s;
+        uint32_t period_us = static_cast<uint32_t>(period_us_f);
+        if (period_us == 0u)
+            period_us = 1u;
+
+        for (uint32_t i = 0; i < steps; ++i) {
+            advanceIndex(dir);
+            if (!writeDirectCurrents())
+                return false;
+            waitMicroseconds(period_us);
+        }
         return true;
     }
 
-private:
-    TMC2208::Device& drv_;
-    float fclk_hz_; // Clock frequency used for VACTUAL scaling
+    void advanceIndex(Direction dir)
+    {
+        const float sin_delta = sin_delta_;
+        const float cos_delta = cos_delta_;
+
+        if (dir == Direction::Forward) {
+            microstep_index_ = (microstep_index_ + 1) % microsteps_per_cycle_;
+            const float new_sin = sine_phase_ * cos_delta + cosine_phase_ * sin_delta;
+            const float new_cos = cosine_phase_ * cos_delta - sine_phase_ * sin_delta;
+            sine_phase_ = new_sin;
+            cosine_phase_ = new_cos;
+        } else {
+            microstep_index_
+                = (microstep_index_ == 0) ? (microsteps_per_cycle_ - 1)
+                                          : (microstep_index_ - 1);
+            const float new_sin = sine_phase_ * cos_delta - cosine_phase_ * sin_delta;
+            const float new_cos = cosine_phase_ * cos_delta + sine_phase_ * sin_delta;
+            sine_phase_ = new_sin;
+            cosine_phase_ = new_cos;
+        }
+
+        if (++renorm_counter_ >= kRenormInterval) {
+            const float mag = sine_phase_ * sine_phase_ + cosine_phase_ * cosine_phase_;
+            if (mag > 0.0f) {
+                const float inv = 1.0f / sqrtf(mag);
+                sine_phase_ *= inv;
+                cosine_phase_ *= inv;
+            }
+            renorm_counter_ = 0;
+        }
+    }
+
+    bool writeDirectCurrents()
+    {
+        const int16_t cur_a = static_cast<int16_t>(
+            lroundf(amplitude_ * sine_phase_));
+        const int16_t cur_b = static_cast<int16_t>(
+            lroundf(amplitude_ * cosine_phase_));
+
+        const uint32_t packed = math::packCurrents(cur_a, cur_b);
+        return motor_.write(tmc2130::Reg::XDIRECT, packed);
+    }
+
+    void waitMicroseconds(uint32_t us)
+    {
+        if (!timer_) {
+            const uint32_t ms = (us + 999u) / 1000u;
+            if (ms != 0u)
+                HAL_Delay(ms);
+            return;
+        }
+
+        if (!timer_started_) {
+            if (HAL_TIM_Base_Start(timer_) == HAL_OK)
+                timer_started_ = true;
+        }
+
+        __HAL_TIM_SET_COUNTER(timer_, 0);
+        while (__HAL_TIM_GET_COUNTER(timer_) < us) { }
+    }
+
+    tmc2130::Motor& motor_;
+    TIM_HandleTypeDef* timer_ = nullptr;
+    bool timer_started_ = false;
+    uint16_t microsteps_per_cycle_ = 256;
+    uint16_t microstep_index_ = 0;
+    float amplitude_ = 247.0f;
+    float fractional_steps_ = 0.0f;
+    float sine_phase_ = 0.0f;
+    float cosine_phase_ = 1.0f;
+    float sin_delta_ = 0.0f;
+    float cos_delta_ = 1.0f;
+    uint16_t renorm_counter_ = 0;
+
+    static constexpr float kPi = 3.14159265f;
+    static constexpr float kTwoPi = 6.28318531f;
+    static constexpr uint16_t kRenormInterval = 64;
+
+    void recalcPhase()
+    {
+        const float angle = (kTwoPi * static_cast<float>(microstep_index_))
+            / static_cast<float>(microsteps_per_cycle_);
+        sine_phase_ = sinf(angle);
+        cosine_phase_ = cosf(angle);
+        const float delta = kTwoPi / static_cast<float>(microsteps_per_cycle_);
+        sin_delta_ = sinf(delta);
+        cos_delta_ = cosf(delta);
+        renorm_counter_ = 0;
+    }
 };
+
 } // namespace motion
