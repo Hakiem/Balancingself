@@ -123,4 +123,3 @@ inline constexpr uint32_t makePwmconf(uint8_t pwm_ampl, uint8_t pwm_grad,
 }
 
 } // namespace tmc2130::detail
-

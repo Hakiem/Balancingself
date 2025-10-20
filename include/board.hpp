@@ -1,9 +1,18 @@
-#include "board.h"
+#pragma once
+
 #include "main.h"
 
+#ifdef __cplusplus
 extern "C" {
+#endif
 
-void SystemClock_Config(void)
+extern I2C_HandleTypeDef hi2c1;
+extern SPI_HandleTypeDef hspi1;
+extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart2;
+extern TIM_HandleTypeDef htim2;
+
+inline void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
     RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
@@ -35,7 +44,7 @@ void SystemClock_Config(void)
     }
 }
 
-void MX_I2C1_Init(void)
+inline void MX_I2C1_Init(void)
 {
     hi2c1.Instance = I2C1;
     hi2c1.Init.Timing = 0x0010020A;
@@ -59,7 +68,7 @@ void MX_I2C1_Init(void)
     }
 }
 
-void MX_SPI1_Init(void)
+inline void MX_SPI1_Init(void)
 {
     hspi1.Instance = SPI1;
     hspi1.Init.Mode = SPI_MODE_MASTER;
@@ -80,7 +89,7 @@ void MX_SPI1_Init(void)
     }
 }
 
-void MX_USART2_UART_Init(void)
+inline void MX_USART2_UART_Init(void)
 {
     huart2.Instance = USART2;
     huart2.Init.BaudRate = 115200;
@@ -97,7 +106,7 @@ void MX_USART2_UART_Init(void)
     }
 }
 
-void MX_TIM2_Init(void)
+inline void MX_TIM2_Init(void)
 {
     TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
     TIM_MasterConfigTypeDef sMasterConfig = { 0 };
@@ -122,7 +131,7 @@ void MX_TIM2_Init(void)
     }
 }
 
-void MX_USART1_UART_Init(void)
+inline void MX_USART1_UART_Init(void)
 {
     huart1.Instance = USART1;
     huart1.Init.BaudRate = 115200;
@@ -135,42 +144,42 @@ void MX_USART1_UART_Init(void)
     huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
     huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
 
-    // Back to half-duplex initialization
     if (HAL_HalfDuplex_Init(&huart1) != HAL_OK) {
         Error_Handler();
     }
 }
 
-void MX_GPIO_Init(void)
+inline void MX_GPIO_Init(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    // Configure PA12 as input for MPU6050 INT
     GPIO_InitTypeDef GPIO_InitStruct = { 0 };
     GPIO_InitStruct.Pin = GPIO_PIN_12;
     GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-    GPIO_InitStruct.Pull = GPIO_NOPULL; // Or GPIO_PULLUP if needed
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
     HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
 
-void BlinkyLED(void)
+inline void BlinkyLED(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-    GPIO_InitStruct.Pin = GPIO_PIN_3; // PB3
+    GPIO_InitStruct.Pin = GPIO_PIN_3;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
-void Error_Handler(void)
+inline void Error_Handler(void)
 {
     __disable_irq();
     while (1) { }
 }
 
-} // extern "C"
+#ifdef __cplusplus
+}
+#endif

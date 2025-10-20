@@ -1,4 +1,4 @@
-#include "board.h"
+#include "board.hpp"
 #include "logger.hpp"
 #include "main.h"
 #include "motion_profile.hpp"
