@@ -51,6 +51,7 @@ jobs:
         if: always()
         with:
           files: test-results/**/*.xml
+          comment_mode: off
 
       - name: Upload test report
         uses: actions/upload-artifact@v4
