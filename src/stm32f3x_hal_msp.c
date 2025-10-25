@@ -49,55 +49,59 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
 {
     GPIO_InitTypeDef GPIO_InitStruct = { 0 };
     if (hspi->Instance == SPI1) {
+        /* USER CODE BEGIN SPI1_MspInit 0 */
+
+        /* USER CODE END SPI1_MspInit 0 */
         /* Peripheral clock enable */
         __HAL_RCC_SPI1_CLK_ENABLE();
-        __HAL_RCC_GPIOA_CLK_ENABLE();
+
+        __HAL_RCC_GPIOB_CLK_ENABLE();
+
         /**SPI1 GPIO Configuration
-        PA5     ------> SPI1_SCK
-        PA6     ------> SPI1_MISO
-        PA7     ------> SPI1_MOSI
+        PB3     ------> SPI1_SCK
+        PB4     ------> SPI1_MISO
+        PB5     ------> SPI1_MOSI
         */
-        GPIO_InitStruct.Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
+        /* SCK + MOSI */
+        GPIO_InitStruct.Pin = GPIO_PIN_3 | GPIO_PIN_5;
         GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull = GPIO_NOPULL;
         GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
         GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
-        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+        /* MISO requires a pull-up because TMC2130 SDO is open-drain */
+        GPIO_InitStruct.Pin = GPIO_PIN_4;
+        GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+        GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
     }
 }
 
 void HAL_SPI_MspDeInit(SPI_HandleTypeDef* hspi)
 {
     if (hspi->Instance == SPI1) {
+        /* USER CODE BEGIN SPI1_MspDeInit 0 */
+
+        /* USER CODE END SPI1_MspDeInit 0 */
         /* Peripheral clock disable */
         __HAL_RCC_SPI1_CLK_DISABLE();
+
         /**SPI1 GPIO Configuration
-        PA5     ------> SPI1_SCK
-        PA6     ------> SPI1_MISO
-        PA7     ------> SPI1_MOSI
+        PB3     ------> SPI1_SCK
+        PB4     ------> SPI1_MISO
+        PB5     ------> SPI1_MOSI
         */
-        HAL_GPIO_DeInit(GPIOA, GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7);
+        HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5);
     }
 }
 
 void HAL_UART_MspInit(UART_HandleTypeDef* huart)
 {
     GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-    if (huart->Instance == USART1) {
-        __HAL_RCC_USART1_CLK_ENABLE();
-
-        __HAL_RCC_GPIOA_CLK_ENABLE();
-        /**USART1 GPIO Configuration
-        PA9     ------> USART1_TX
-        */
-        GPIO_InitStruct.Pin = GPIO_PIN_9;
-        GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-        GPIO_InitStruct.Pull = GPIO_NOPULL; // lex needs idle-high
-        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-        GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
-        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    } else if (huart->Instance == USART2) {
+    if (huart->Instance == USART2) {
         /* Peripheral clock enable */
         __HAL_RCC_USART2_CLK_ENABLE();
         __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -116,14 +120,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
 
 void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
 {
-    if (huart->Instance == USART1) {
-        __HAL_RCC_USART1_CLK_DISABLE();
-
-        /**USART1 GPIO Configuration
-        PA9     ------> USART1_TX
-        */
-        HAL_GPIO_DeInit(GPIOA, GPIO_PIN_9);
-    } else if (huart->Instance == USART2) {
+    if (huart->Instance == USART2) {
         /* Peripheral clock disable */
         __HAL_RCC_USART2_CLK_DISABLE();
         /**USART2 GPIO Configuration

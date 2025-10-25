@@ -5,12 +5,13 @@
 #include "spi_bridge.hpp"
 #include "tmc2130_motor.hpp"
 #include "command_processor.hpp"
+#include <cstddef>
 #include <cstring>
+#include <string.h>
 
 extern "C" {
 I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
-UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 TIM_HandleTypeDef htim2;
 }
@@ -32,10 +33,12 @@ struct CsPin {
 
 const CsPin kCsPins[] = {
     { GPIOA, GPIO_PIN_4 },
-    { GPIOB, GPIO_PIN_0 },
+    { GPIOA, GPIO_PIN_5 },
 };
 
-MotorContext motors[2];
+constexpr size_t kMotorCount = sizeof(kCsPins) / sizeof(kCsPins[0]);
+
+MotorContext motors[kMotorCount];
 
 static_assert(sizeof(kCsPins) / sizeof(kCsPins[0]) == sizeof(motors) / sizeof(motors[0]),
     "Mismatch between CS pin table and motor context count");
@@ -74,7 +77,7 @@ void handle_uart_input()
 template <typename Fn>
 void for_each_motor(const char* tag, Fn&& fn)
 {
-    for (size_t i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < kMotorCount; ++i) {
         auto* profile = motors[i].profile;
         if (!profile)
             continue;
@@ -97,17 +100,71 @@ void configure_cs_pins()
     }
 }
 
+bool probe_motor(tmc2130::Motor& drv, size_t index)
+{
+    uint32_t io = 0;
+    if (!drv.read(tmc2130::Reg::IOIN, io)) {
+        logsys::printf("[PROBE][M%u] read IOIN failed (status=0x%02X)\r\n",
+            static_cast<unsigned>(index), drv.lastStatus());
+        return false;
+    }
+
+    uint8_t version = static_cast<uint8_t>(io >> 24);
+    logsys::printf("[PROBE][M%u] IOIN=0x%08lX VERSION=0x%02X\r\n",
+        static_cast<unsigned>(index), io, version);
+
+    if (version != 0x11u) {
+        logsys::printf("[PROBE][M%u] unexpected VERSION, check wiring\r\n",
+            static_cast<unsigned>(index));
+        return false;
+    }
+    return true;
+}
+
 void init_motor_contexts()
 {
     static SPI_Bridge spi0(&hspi1, kCsPins[0].port, kCsPins[0].pin);
-    static SPI_Bridge spi1(&hspi1, kCsPins[1].port, kCsPins[1].pin);
     static tmc2130::Motor drv0(spi0);
-    static tmc2130::Motor drv1(spi1);
     static motion::MotionProfile prof0(drv0, &htim2);
-    static motion::MotionProfile prof1(drv1, &htim2);
-
     motors[0] = MotorContext { &spi0, &drv0, &prof0 };
-    motors[1] = MotorContext { &spi1, &drv1, &prof1 };
+
+    if (kMotorCount > 1) {
+        static SPI_Bridge spi1(&hspi1, kCsPins[1].port, kCsPins[1].pin);
+        static tmc2130::Motor drv1(spi1);
+        static motion::MotionProfile prof1(drv1, &htim2);
+        motors[1] = MotorContext { &spi1, &drv1, &prof1 };
+    }
+
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        auto* drv = motors[i].driver;
+        if (!drv)
+            continue;
+
+        uint32_t io = 0;
+        if (!drv->read(tmc2130::Reg::IOIN, io)) {
+            logsys::printf("[IOIN][M%u] read failed (SPI=0x%02X)\r\n",
+                static_cast<unsigned>(i), static_cast<unsigned>(drv->lastStatus()));
+            continue;
+        }
+
+        uint8_t version = static_cast<uint8_t>(io >> 24);
+        logsys::printf("[IOIN][M%u] value=0x%08lX VERSION=0x%02X (SPI=0x%02X)\r\n",
+            static_cast<unsigned>(i), io, version,
+            static_cast<unsigned>(drv->lastStatus()));
+    }
+
+    bool contact_ok = true;
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        if (motors[i].driver)
+            contact_ok &= probe_motor(*motors[i].driver, i);
+    }
+
+    if (!contact_ok) {
+        logsys::printf("[PROBE] SPI contact failed. Aborting init.\r\n");
+        return;
+    }
+
+    logsys::printf("[PROBE] All drivers responded. Continuing init.\r\n");
 
     for_each_motor("SETUP", [](motion::MotionProfile& p) {
         p.setAmplitude(200.f);
@@ -157,7 +214,7 @@ void process_command()
         logsys::printf("  const <s> <usteps> [dir]\r\n");
         break;
     case command::Type::Status:
-        for (size_t i = 0; i < 2; ++i) {
+        for (size_t i = 0; i < kMotorCount; ++i) {
             auto* drv = motors[i].driver;
             if (!drv)
                 continue;
@@ -248,31 +305,30 @@ int main()
 
     SystemClock_Config();
     MX_SPI1_Init();
-    MX_I2C1_Init();
-    MX_USART1_UART_Init();
+    //MX_I2C1_Init();
     MX_USART2_UART_Init();
-    MX_TIM2_Init();
+    //MX_TIM2_Init();
     MX_GPIO_Init();
-    BlinkyLED();
+    // BlinkyLED();
 
     logsys::init(&huart2);
     print_banner();
     logsys::printf("[BOOT] Ready.\r\n");
 
-    configure_cs_pins();
+    // configure_cs_pins();
     init_motor_contexts();
 
     while (true) {
         handle_uart_input();
         process_command();
 
-        static uint32_t last_blink = 0;
-        uint32_t now = HAL_GetTick();
-        if (now - last_blink >= kBlinkIntervalMs) {
-            HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
-            last_blink = now;
-        }
-
+        // static uint32_t last_blink = 0;
+        // uint32_t now = HAL_GetTick();
+        // if (now - last_blink >= kBlinkIntervalMs) {
+        //     HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
+        //     last_blink = now;
+        // }
+ 
         HAL_Delay(1);
     }
 }
