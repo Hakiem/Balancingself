@@ -164,6 +164,33 @@ void init_motor_contexts()
         return;
     }
 
+    tmc2130::Motor::Config cfg;
+    cfg.direct_mode = false;
+    cfg.enable_stealthchop = true;
+    cfg.write_pwmconf = true;
+    cfg.write_chopconf = true;
+    cfg.write_tpwmthrs = true;
+    cfg.tpwmthrs = 0x0000200u;
+    cfg.ihold = 12;
+    cfg.irun = 28;
+    cfg.ihold_delay = 8;
+    cfg.pwm_ampl = 200;
+    cfg.pwm_grad = 8;
+    cfg.pwm_freq = 1;
+
+    for (auto& ctx : motors) {
+        if (ctx.driver && ctx.driver->initialize(cfg)) {
+            ctx.driver->setRampMode(0);
+            ctx.driver->setVStart(10);
+            ctx.driver->setVStop(10);
+            ctx.driver->setAmax(1000);
+            ctx.driver->setDmax(1000);
+            logsys::printf("[INIT] motor ready\r\n");
+        } else {
+            logsys::printf("[INIT] motor init failed\r\n");
+        }
+    }
+
     logsys::printf("[PROBE] All drivers responded. Continuing init.\r\n");
 
     for_each_motor("SETUP", [](motion::MotionProfile& p) {
@@ -171,20 +198,6 @@ void init_motor_contexts()
         p.setMicrostepResolution(256);
         return true;
     });
-
-    tmc2130::Motor::Config cfg;
-    cfg.direct_mode = true;
-    cfg.enable_stealthchop = false;
-    cfg.write_pwmconf = false;
-    cfg.write_chopconf = true;
-
-    for (auto& ctx : motors) {
-        if (ctx.driver && ctx.driver->initialize(cfg)) {
-            logsys::printf("[INIT] motor ready\r\n");
-        } else {
-            logsys::printf("[INIT] motor init failed\r\n");
-        }
-    }
 }
 
 void process_command()
