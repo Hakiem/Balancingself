@@ -1,66 +1,41 @@
 #pragma once
 
-#include "motion_math.hpp"
 #include "motion_types.hpp"
 #ifdef UNIT_TEST
 #include "hal_stubs.hpp"
 #else
 #include "stm32f3xx_hal.h"
 #endif
-#include "tmc2130_motor.hpp"
 #include <cmath>
 #include <cstdint>
-#include <math.h>
+#include <deque>
 
 namespace motion {
 
-/**
- * @brief SPI-only motion helper that drives TMC2130 in direct mode (XDIRECT).
- *
- * The class synthesises sine/cosine coil currents for the requested velocity
- * profile and streams them to the driver via @ref tmc2130::Motor. No STEP/DIR
- * pins are used; all motion is produced through SPI writes to @ref Reg::XDIRECT.
- */
 class MotionProfile final
 {
 public:
-    /**
-     * @brief Construct the profile helper.
-     *
-     * @param motor Reference to an initialised TMC2130 motor wrapper. Make sure
-     *              GCONF.direct_mode is enabled before issuing movement.
-     * @param timer Optional hardware timer providing microsecond timing for
-     *              microstep updates. When nullptr the helper falls back to
-     *              coarse millisecond delays.
-     */
-    explicit MotionProfile(
-        tmc2130::Motor& motor, TIM_HandleTypeDef* timer = nullptr)
-        : motor_(motor)
+    struct StepPins {
+        GPIO_TypeDef* step_port = nullptr;
+        uint16_t step_pin = 0;
+        GPIO_TypeDef* dir_port = nullptr;
+        uint16_t dir_pin = 0;
+        uint32_t tim_channel = 0;
+    };
+
+    MotionProfile(const StepPins& pins, TIM_HandleTypeDef* timer = nullptr)
+        : pins_(pins)
         , timer_(timer)
     {
-        if (timer_) {
-            HAL_TIM_Base_Start(timer_);
-            timer_started_ = true;
-        }
-        recalcPhase();
     }
 
-    /**
-     * @brief Set the number of microsteps used to complete one electrical revolution.
-     */
     void setMicrostepResolution(uint16_t microsteps)
     {
         if (microsteps == 0)
             microsteps = 256;
         microsteps_per_cycle_ = microsteps;
-        if (microstep_index_ >= microsteps_per_cycle_)
-            microstep_index_ %= microsteps_per_cycle_;
-        recalcPhase();
     }
 
-    /**
-     * @brief Adjust the sine wave amplitude (0…255).
-     */
     void setAmplitude(float amplitude)
     {
         if (amplitude < 0.f)
@@ -70,11 +45,19 @@ public:
         amplitude_ = amplitude;
     }
 
-    /**
-     * @brief Access the underlying motor helper.
-     */
-    tmc2130::Motor& driver() { return motor_; }
-    const tmc2130::Motor& driver() const { return motor_; }
+    bool runConstantVelocity(
+        float duration_s, float usteps_s, Direction dir = Direction::Forward)
+    {
+        if (duration_s <= 0.f && usteps_s <= 0.f)
+            return false;
+
+        uint32_t duration_ms = static_cast<uint32_t>(duration_s * 1000.f);
+        if (duration_ms == 0u && usteps_s > 0.f)
+            duration_ms = kDefaultIntervalMs;
+
+        enqueueSegment(Segment { dir, usteps_s, duration_ms, false });
+        return true;
+    }
 
     bool runSCurve(float duration_s, float peak_usteps_s,
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
@@ -82,7 +65,7 @@ public:
         return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
             [](float t) {
                 const float t2 = (t <= 0.5f) ? (t * 2.f) : ((1.f - t) * 2.f);
-                return 0.5f * (1.f - cosf(kPi * t2));
+                return 0.5f * (1.f - std::cos(static_cast<float>(kPi) * t2));
             });
     }
 
@@ -90,9 +73,7 @@ public:
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
     {
         return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
-            [](float t) {
-                return (t <= 0.5f) ? (t * 2.f) : (2.f - 2.f * t);
-            });
+            [](float t) { return (t <= 0.5f) ? (t * 2.f) : (2.f - 2.f * t); });
     }
 
     bool runTrapezoidal(float accel_time_s, float const_time_s,
@@ -114,7 +95,7 @@ public:
         if (!runRamp(decel_time_s, peak_usteps_s, dir, update_period_ms, false))
             return false;
 
-        return stop();
+        return true;
     }
 
     bool runExponential(float duration_s, float peak_usteps_s,
@@ -123,46 +104,131 @@ public:
     {
         if (steepness <= 0.f)
             return false;
-        const float denom = expf(steepness) - 1.0f;
+        const float denom = std::exp(steepness) - 1.0f;
         return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
             [steepness, denom](float t) {
                 if (t <= 0.5f) {
                     const float x = t * 2.0f;
-                    return (expf(steepness * x) - 1.0f) / denom * 0.5f;
+                    return (std::exp(steepness * x) - 1.0f) / denom * 0.5f;
                 }
                 const float x = (1.0f - t) * 2.0f;
-                return 1.0f - (expf(steepness * x) - 1.0f) / denom * 0.5f;
+                return 1.0f - (std::exp(steepness * x) - 1.0f) / denom * 0.5f;
             });
-    }
-
-    bool runConstantVelocity(
-        float duration_s, float usteps_s, Direction dir = Direction::Forward)
-    {
-        if (duration_s <= 0.f)
-            return false;
-
-        constexpr uint32_t period_ms = 10;
-        return runProfile(duration_s, usteps_s, dir, period_ms,
-            [](float) { return 1.f; });
     }
 
     bool runSinusoidal(float duration_s, float peak_usteps_s,
         Direction dir = Direction::Forward, uint32_t update_period_ms = 10)
     {
         return runProfile(duration_s, peak_usteps_s, dir, update_period_ms,
-            [](float t) { return sinf(kPi * t); });
+            [](float t) { return std::sin(static_cast<float>(kPi) * t); });
     }
 
-    /**
-     * @brief Immediately halt motion (no additional SPI writes).
-     */
     bool stop()
     {
+        queue_.clear();
+        active_ = false;
+        endless_running_ = false;
         fractional_steps_ = 0.f;
-        return motor_.write(tmc2130::Reg::XDIRECT, 0);
+        steps_remaining_ = 0;
+        current_velocity_ = 0.f;
+        total_steps_ = 0;
+        if (timer_)
+            HAL_TIM_OC_Stop_IT(timer_, pins_.tim_channel);
+        HAL_GPIO_WritePin(pins_.step_port, pins_.step_pin, GPIO_PIN_RESET);
+        return true;
     }
 
+    bool runForever(float usteps_s, Direction dir)
+    {
+        if (usteps_s <= 0.f)
+            return false;
+        enqueueSegment(Segment { dir, usteps_s, 0u, true });
+        return true;
+    }
+
+    bool updateVelocity(float usteps_s, Direction dir)
+    {
+        if (usteps_s <= 0.f)
+            return stop();
+
+        queue_.clear();
+        current_velocity_ = usteps_s;
+        last_velocity_ = usteps_s;
+        current_direction_ = dir;
+        last_direction_ = dir;
+        HAL_GPIO_WritePin(
+            pins_.dir_port, pins_.dir_pin,
+            (dir == Direction::Forward) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+        interval_ticks_ = computeIntervalTicks(current_velocity_);
+        if (interval_ticks_ == 0)
+            interval_ticks_ = 1;
+
+        if (!active_) {
+            steps_remaining_ = 0;
+            fractional_steps_ = 0.f;
+            endless_running_ = true;
+            if (!timer_started_ && timer_) {
+                HAL_TIM_Base_Start(timer_);
+                timer_started_ = true;
+            }
+            if (timer_) {
+                uint32_t now = __HAL_TIM_GET_COUNTER(timer_);
+                __HAL_TIM_SET_COMPARE(timer_, pins_.tim_channel, now + interval_ticks_);
+                HAL_TIM_OC_Start_IT(timer_, pins_.tim_channel);
+            }
+            active_ = true;
+            toggle_state_ = false;
+            HAL_GPIO_WritePin(pins_.step_port, pins_.step_pin, GPIO_PIN_RESET);
+            return true;
+        }
+
+        if (timer_) {
+            uint32_t now = __HAL_TIM_GET_COUNTER(timer_);
+            __HAL_TIM_SET_COMPARE(timer_, pins_.tim_channel, now + interval_ticks_);
+        }
+        return true;
+    }
+
+    void handleTimerEvent()
+    {
+        if (!active_ || current_velocity_ <= 0.f)
+            return;
+
+        toggle_state_ = !toggle_state_;
+        HAL_GPIO_WritePin(pins_.step_port, pins_.step_pin,
+            toggle_state_ ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+        if (timer_) {
+            const uint32_t current_compare
+                = __HAL_TIM_GET_COMPARE(timer_, pins_.tim_channel);
+            __HAL_TIM_SET_COMPARE(timer_, pins_.tim_channel, current_compare + interval_ticks_);
+        }
+
+        if (toggle_state_) {
+            ++total_steps_;
+            if (!endless_running_) {
+                if (steps_remaining_ > 0) {
+                    --steps_remaining_;
+                    if (steps_remaining_ == 0)
+                        advanceSegment();
+                }
+            }
+        }
+    }
+
+    float lastVelocity() const { return last_velocity_; }
+    Direction lastDirection() const { return last_direction_; }
+    uint32_t lastStepCount() const { return total_steps_; }
+
 private:
+    struct Segment {
+        Direction dir;
+        float velocity_usteps_s;
+        uint32_t duration_ms;
+        bool endless;
+    };
+
     template <typename Curve>
     bool runProfile(float duration_s, float peak_usteps_s, Direction dir,
         uint32_t update_period_ms, Curve curve)
@@ -180,12 +246,19 @@ private:
             float magnitude = peak_usteps_s * curve(t);
             if (magnitude < 0.f)
                 magnitude = 0.f;
-            if (!applyVelocity(dir, magnitude, update_period_ms))
-                return false;
+            enqueueSegment(Segment { dir, magnitude, update_period_ms, false });
         }
-        return stop();
-    }
+        const float consumed_time = static_cast<float>(segments * update_period_ms) / 1000.f;
+        const float remaining_time = duration_s - consumed_time;
+        if (remaining_time > 0.f) {
+            const uint32_t remainder_ms
+                = static_cast<uint32_t>(remaining_time * 1000.f);
+            if (remainder_ms > 0u)
+                enqueueSegment(Segment { dir, peak_usteps_s, remainder_ms, false });
+        }
 
+        return true;
+    }
     bool runRamp(float duration_s, float peak_usteps_s, Direction dir,
         uint32_t update_period_ms, bool accelerating)
     {
@@ -195,133 +268,113 @@ private:
             });
     }
 
-    bool applyVelocity(
-        Direction dir, float usteps_per_s, uint32_t update_period_ms)
+    void enqueueSegment(const Segment& seg)
     {
-        if (update_period_ms == 0u)
-            return false;
-        if (usteps_per_s <= 0.f) {
+        const bool reset_required = (!active_ && queue_.empty());
+        queue_.push_back(seg);
+        if (reset_required) {
+            total_steps_ = 0;
             fractional_steps_ = 0.f;
-            return true;
+            steps_remaining_ = 0;
         }
-
-        const float interval_s
-            = static_cast<float>(update_period_ms) * 0.001f;
-        float desired_steps = usteps_per_s * interval_s + fractional_steps_;
-        const uint32_t whole_steps = static_cast<uint32_t>(desired_steps);
-        fractional_steps_ = desired_steps - static_cast<float>(whole_steps);
-
-        return emitMicrosteps(dir, whole_steps, usteps_per_s);
+        if (!active_)
+            advanceSegment();
     }
 
-    bool emitMicrosteps(Direction dir, uint32_t steps, float usteps_per_s)
+    void advanceSegment()
     {
-        if (steps == 0)
-            return true;
-
-        const float period_us_f = 1'000'000.0f / usteps_per_s;
-        uint32_t period_us = static_cast<uint32_t>(period_us_f);
-        if (period_us == 0u)
-            period_us = 1u;
-
-        for (uint32_t i = 0; i < steps; ++i) {
-            advanceIndex(dir);
-            if (!writeDirectCurrents())
-                return false;
-            waitMicroseconds(period_us);
-        }
-        return true;
-    }
-
-    void advanceIndex(Direction dir)
-    {
-        const float sin_delta = sin_delta_;
-        const float cos_delta = cos_delta_;
-
-        if (dir == Direction::Forward) {
-            microstep_index_ = (microstep_index_ + 1) % microsteps_per_cycle_;
-            const float new_sin = sine_phase_ * cos_delta + cosine_phase_ * sin_delta;
-            const float new_cos = cosine_phase_ * cos_delta - sine_phase_ * sin_delta;
-            sine_phase_ = new_sin;
-            cosine_phase_ = new_cos;
-        } else {
-            microstep_index_
-                = (microstep_index_ == 0) ? (microsteps_per_cycle_ - 1)
-                                          : (microstep_index_ - 1);
-            const float new_sin = sine_phase_ * cos_delta - cosine_phase_ * sin_delta;
-            const float new_cos = cosine_phase_ * cos_delta + sine_phase_ * sin_delta;
-            sine_phase_ = new_sin;
-            cosine_phase_ = new_cos;
-        }
-
-        if (++renorm_counter_ >= kRenormInterval) {
-            const float mag = sine_phase_ * sine_phase_ + cosine_phase_ * cosine_phase_;
-            if (mag > 0.0f) {
-                const float inv = 1.0f / sqrtf(mag);
-                sine_phase_ *= inv;
-                cosine_phase_ *= inv;
+        while (!queue_.empty()) {
+            Segment seg = queue_.front();
+            queue_.pop_front();
+            if (seg.velocity_usteps_s <= 0.f) {
+                continue;
             }
-            renorm_counter_ = 0;
-        }
-    }
 
-    bool writeDirectCurrents()
-    {
-        const int16_t cur_a = static_cast<int16_t>(
-            lroundf(amplitude_ * sine_phase_));
-        const int16_t cur_b = static_cast<int16_t>(
-            lroundf(amplitude_ * cosine_phase_));
+            current_direction_ = seg.dir;
+            last_direction_ = seg.dir;
+            HAL_GPIO_WritePin(
+                pins_.dir_port, pins_.dir_pin,
+                (seg.dir == Direction::Forward) ? GPIO_PIN_RESET : GPIO_PIN_SET);
 
-        const uint32_t packed = math::packCurrents(cur_a, cur_b);
-        return motor_.write(tmc2130::Reg::XDIRECT, packed);
-    }
+            current_velocity_ = seg.velocity_usteps_s;
+            last_velocity_ = current_velocity_;
 
-    void waitMicroseconds(uint32_t us)
-    {
-        if (!timer_) {
-            const uint32_t ms = (us + 999u) / 1000u;
-            if (ms != 0u)
-                HAL_Delay(ms);
+            endless_running_ = seg.endless;
+            if (!seg.endless) {
+                double total_steps = (static_cast<double>(seg.duration_ms) / 1000.0)
+                    * static_cast<double>(seg.velocity_usteps_s)
+                    + fractional_steps_;
+                steps_remaining_ = static_cast<uint32_t>(total_steps);
+                fractional_steps_ = static_cast<float>(total_steps - steps_remaining_);
+                if (steps_remaining_ == 0 && seg.velocity_usteps_s > 0.f) {
+                    steps_remaining_ = 1;
+                    fractional_steps_ = 0.f;
+                }
+            } else {
+                steps_remaining_ = 0;
+            }
+
+            interval_ticks_ = computeIntervalTicks(current_velocity_);
+            if (interval_ticks_ == 0)
+                interval_ticks_ = 1;
+
+            toggle_state_ = false;
+            HAL_GPIO_WritePin(pins_.step_port, pins_.step_pin, GPIO_PIN_RESET);
+
+            if (!timer_started_ && timer_) {
+                HAL_TIM_Base_Start(timer_);
+                timer_started_ = true;
+            }
+
+            if (timer_) {
+                uint32_t now = __HAL_TIM_GET_COUNTER(timer_);
+                __HAL_TIM_SET_COMPARE(timer_, pins_.tim_channel, now + interval_ticks_);
+                HAL_TIM_OC_Start_IT(timer_, pins_.tim_channel);
+            }
+            active_ = true;
             return;
         }
 
-        if (!timer_started_) {
-            if (HAL_TIM_Base_Start(timer_) == HAL_OK)
-                timer_started_ = true;
-        }
-
-        __HAL_TIM_SET_COUNTER(timer_, 0);
-        while (__HAL_TIM_GET_COUNTER(timer_) < us) { }
+        active_ = false;
+        endless_running_ = false;
+        current_velocity_ = 0.f;
+        if (timer_)
+            HAL_TIM_OC_Stop_IT(timer_, pins_.tim_channel);
+        HAL_GPIO_WritePin(pins_.step_port, pins_.step_pin, GPIO_PIN_RESET);
     }
 
-    tmc2130::Motor& motor_;
+    static uint32_t computeIntervalTicks(float velocity)
+    {
+        if (velocity <= 0.f)
+            return 0u;
+        double toggle_interval = 500000.0 / static_cast<double>(velocity);
+        if (toggle_interval < 1.0)
+            toggle_interval = 1.0;
+        if (toggle_interval > static_cast<double>(0xFFFFFFFFu))
+            toggle_interval = static_cast<double>(0xFFFFFFFFu);
+        return static_cast<uint32_t>(toggle_interval);
+    }
+
+    StepPins pins_;
     TIM_HandleTypeDef* timer_ = nullptr;
     bool timer_started_ = false;
+    std::deque<Segment> queue_;
+    bool active_ = false;
+    bool endless_running_ = false;
+    bool toggle_state_ = false;
     uint16_t microsteps_per_cycle_ = 256;
-    uint16_t microstep_index_ = 0;
-    float amplitude_ = 247.0f;
-    float fractional_steps_ = 0.0f;
-    float sine_phase_ = 0.0f;
-    float cosine_phase_ = 1.0f;
-    float sin_delta_ = 0.0f;
-    float cos_delta_ = 1.0f;
-    uint16_t renorm_counter_ = 0;
+    float amplitude_ = 200.f;
+    float last_velocity_ = 0.f;
+    Direction last_direction_ = Direction::Forward;
+    Direction current_direction_ = Direction::Forward;
+    uint32_t total_steps_ = 0;
+    uint32_t steps_remaining_ = 0;
+    float fractional_steps_ = 0.f;
+    float current_velocity_ = 0.f;
+    uint32_t interval_ticks_ = 0u;
 
-    static constexpr float kPi = 3.14159265f;
-    static constexpr float kTwoPi = 6.28318531f;
-    static constexpr uint16_t kRenormInterval = 64;
-
-    void recalcPhase()
-    {
-        const float angle = (kTwoPi * static_cast<float>(microstep_index_))
-            / static_cast<float>(microsteps_per_cycle_);
-        sine_phase_ = sinf(angle);
-        cosine_phase_ = cosf(angle);
-        const float delta = kTwoPi / static_cast<float>(microsteps_per_cycle_);
-        sin_delta_ = sinf(delta);
-        cos_delta_ = cosf(delta);
-        renorm_counter_ = 0;
-    }
+    static constexpr uint32_t kDefaultIntervalMs = 10;
+    static constexpr double kPi = 3.14159265358979323846;
 };
 
 } // namespace motion

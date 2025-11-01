@@ -15,6 +15,8 @@ enum class Type {
     Stop,
     SetAmplitude,
     SetMicrosteps,
+    Run,
+    Speed,
     Scurve,
     Triangle,
     Trapezoid,
@@ -35,6 +37,7 @@ struct Command {
     uint32_t period_ms = 0;
     uint32_t microsteps = 0;
     motion::Direction direction = motion::Direction::Forward;
+    bool endless = false;
 };
 
 /**
@@ -129,6 +132,39 @@ inline Command parse(char* buffer)
             return cmd;
         cmd.type = Type::SetMicrosteps;
         cmd.microsteps = steps;
+        return cmd;
+    }
+    if (equals_ignore_case(token, "run")) {
+        float speed = 0.f;
+        if (!parse_float_token(std::strtok(nullptr, " "), speed))
+            return cmd;
+        motion::Direction dir = motion::Direction::Forward;
+        char* next = std::strtok(nullptr, " ");
+        if (next) {
+            motion::Direction tmp;
+            if (parse_direction_token(next, tmp))
+                dir = tmp;
+        }
+        cmd.type = Type::Run;
+        cmd.peak = speed;
+        cmd.direction = dir;
+        cmd.endless = true;
+        return cmd;
+    }
+    if (equals_ignore_case(token, "speed")) {
+        float speed = 0.f;
+        if (!parse_float_token(std::strtok(nullptr, " "), speed))
+            return cmd;
+        motion::Direction dir = motion::Direction::Forward;
+        char* next = std::strtok(nullptr, " ");
+        if (next) {
+            motion::Direction tmp;
+            if (parse_direction_token(next, tmp))
+                dir = tmp;
+        }
+        cmd.type = Type::Speed;
+        cmd.peak = speed;
+        cmd.direction = dir;
         return cmd;
     }
     if (equals_ignore_case(token, "scurve")) {

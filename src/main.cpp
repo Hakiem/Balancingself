@@ -2,8 +2,6 @@
 #include "logger.hpp"
 #include "main.h"
 #include "motion_profile.hpp"
-#include "spi_bridge.hpp"
-#include "tmc2130_motor.hpp"
 #include "command_processor.hpp"
 #include <cstddef>
 #include <cstring>
@@ -11,7 +9,6 @@
 
 extern "C" {
 I2C_HandleTypeDef hi2c1;
-SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart2;
 TIM_HandleTypeDef htim2;
 }
@@ -21,27 +18,22 @@ namespace {
 constexpr uint32_t kBlinkIntervalMs = 1000;
 
 struct MotorContext {
-    SPI_Bridge* spi = nullptr;
-    tmc2130::Motor* driver = nullptr;
     motion::MotionProfile* profile = nullptr;
 };
 
-struct CsPin {
-    GPIO_TypeDef* port;
-    uint16_t pin;
+const motion::MotionProfile::StepPins kStepPins[] = {
+    { GPIOA, GPIO_PIN_0, GPIOB, GPIO_PIN_4, TIM_CHANNEL_1 },
+    { GPIOA, GPIO_PIN_1, GPIOB, GPIO_PIN_5, TIM_CHANNEL_2 },
 };
 
-const CsPin kCsPins[] = {
-    { GPIOA, GPIO_PIN_4 },
-    { GPIOA, GPIO_PIN_5 },
-};
-
-constexpr size_t kMotorCount = sizeof(kCsPins) / sizeof(kCsPins[0]);
+constexpr size_t kMotorCount = sizeof(kStepPins) / sizeof(kStepPins[0]);
 
 MotorContext motors[kMotorCount];
 
-static_assert(sizeof(kCsPins) / sizeof(kCsPins[0]) == sizeof(motors) / sizeof(motors[0]),
-    "Mismatch between CS pin table and motor context count");
+motion::MotionProfile* g_profiles[kMotorCount] = { nullptr };
+
+static_assert(sizeof(kStepPins) / sizeof(kStepPins[0]) == sizeof(motors) / sizeof(motors[0]),
+    "Mismatch between step pin table and motor context count");
 
 char cmd_buffer[128];
 uint8_t cmd_index = 0;
@@ -87,117 +79,25 @@ void for_each_motor(const char* tag, Fn&& fn)
     }
 }
 
-void configure_cs_pins()
-{
-    for (const auto& cs : kCsPins) {
-        GPIO_InitTypeDef gpio = { 0 };
-        gpio.Pin = cs.pin;
-        gpio.Mode = GPIO_MODE_OUTPUT_PP;
-        gpio.Pull = GPIO_NOPULL;
-        gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-        HAL_GPIO_Init(cs.port, &gpio);
-        HAL_GPIO_WritePin(cs.port, cs.pin, GPIO_PIN_SET);
-    }
-}
-
-bool probe_motor(tmc2130::Motor& drv, size_t index)
-{
-    uint32_t io = 0;
-    if (!drv.read(tmc2130::Reg::IOIN, io)) {
-        logsys::printf("[PROBE][M%u] read IOIN failed (status=0x%02X)\r\n",
-            static_cast<unsigned>(index), drv.lastStatus());
-        return false;
-    }
-
-    uint8_t version = static_cast<uint8_t>(io >> 24);
-    logsys::printf("[PROBE][M%u] IOIN=0x%08lX VERSION=0x%02X\r\n",
-        static_cast<unsigned>(index), io, version);
-
-    if (version != 0x11u) {
-        logsys::printf("[PROBE][M%u] unexpected VERSION, check wiring\r\n",
-            static_cast<unsigned>(index));
-        return false;
-    }
-    return true;
-}
-
 void init_motor_contexts()
 {
-    static SPI_Bridge spi0(&hspi1, kCsPins[0].port, kCsPins[0].pin);
-    static tmc2130::Motor drv0(spi0);
-    static motion::MotionProfile prof0(drv0, &htim2);
-    motors[0] = MotorContext { &spi0, &drv0, &prof0 };
+    static motion::MotionProfile prof0(kStepPins[0], &htim2);
+    motors[0] = MotorContext { &prof0 };
+    g_profiles[0] = &prof0;
 
     if (kMotorCount > 1) {
-        static SPI_Bridge spi1(&hspi1, kCsPins[1].port, kCsPins[1].pin);
-        static tmc2130::Motor drv1(spi1);
-        static motion::MotionProfile prof1(drv1, &htim2);
-        motors[1] = MotorContext { &spi1, &drv1, &prof1 };
+        static motion::MotionProfile prof1(kStepPins[1], &htim2);
+        motors[1] = MotorContext { &prof1 };
+        g_profiles[1] = &prof1;
     }
-
-    for (size_t i = 0; i < kMotorCount; ++i) {
-        auto* drv = motors[i].driver;
-        if (!drv)
-            continue;
-
-        uint32_t io = 0;
-        if (!drv->read(tmc2130::Reg::IOIN, io)) {
-            logsys::printf("[IOIN][M%u] read failed (SPI=0x%02X)\r\n",
-                static_cast<unsigned>(i), static_cast<unsigned>(drv->lastStatus()));
-            continue;
-        }
-
-        uint8_t version = static_cast<uint8_t>(io >> 24);
-        logsys::printf("[IOIN][M%u] value=0x%08lX VERSION=0x%02X (SPI=0x%02X)\r\n",
-            static_cast<unsigned>(i), io, version,
-            static_cast<unsigned>(drv->lastStatus()));
-    }
-
-    bool contact_ok = true;
-    for (size_t i = 0; i < kMotorCount; ++i) {
-        if (motors[i].driver)
-            contact_ok &= probe_motor(*motors[i].driver, i);
-    }
-
-    if (!contact_ok) {
-        logsys::printf("[PROBE] SPI contact failed. Aborting init.\r\n");
-        return;
-    }
-
-    tmc2130::Motor::Config cfg;
-    cfg.direct_mode = false;
-    cfg.enable_stealthchop = true;
-    cfg.write_pwmconf = true;
-    cfg.write_chopconf = true;
-    cfg.write_tpwmthrs = true;
-    cfg.tpwmthrs = 0x0000200u;
-    cfg.ihold = 12;
-    cfg.irun = 28;
-    cfg.ihold_delay = 8;
-    cfg.pwm_ampl = 200;
-    cfg.pwm_grad = 8;
-    cfg.pwm_freq = 1;
-
-    for (auto& ctx : motors) {
-        if (ctx.driver && ctx.driver->initialize(cfg)) {
-            ctx.driver->setRampMode(0);
-            ctx.driver->setVStart(10);
-            ctx.driver->setVStop(10);
-            ctx.driver->setAmax(1000);
-            ctx.driver->setDmax(1000);
-            logsys::printf("[INIT] motor ready\r\n");
-        } else {
-            logsys::printf("[INIT] motor init failed\r\n");
-        }
-    }
-
-    logsys::printf("[PROBE] All drivers responded. Continuing init.\r\n");
 
     for_each_motor("SETUP", [](motion::MotionProfile& p) {
         p.setAmplitude(200.f);
         p.setMicrostepResolution(256);
         return true;
     });
+
+    logsys::printf("[INIT] Motion profiles ready.\r\n");
 }
 
 void process_command()
@@ -210,7 +110,7 @@ void process_command()
 
     command::Command cmd = command::parse(cmd_buffer);
 
-    switch (cmd.type) {
+switch (cmd.type) {
     case command::Type::Help:
         logsys::printf("Commands:\r\n");
         logsys::printf("  help\r\n");
@@ -218,28 +118,27 @@ void process_command()
         logsys::printf("  stop\r\n");
         logsys::printf("  amplitude <0..255>\r\n");
         logsys::printf("  microsteps <steps>\r\n");
+        logsys::printf("  run <usteps_s> [dir]\r\n");
+        logsys::printf("  speed <usteps_s> [dir]\r\n");
         logsys::printf("  scurve <s> <usteps> [dir] [period_ms]\r\n");
         logsys::printf("  triangle <s> <usteps> [dir] [period_ms]\r\n");
-        logsys::printf(
-            "  trapezoid <accel> <const> <decel> <usteps> [dir] [period_ms]\r\n");
+        logsys::printf("  trapezoid <accel> <const> <decel> <usteps> [dir] [period_ms]\r\n");
         logsys::printf("  expo <s> <usteps> [steep] [dir] [period_ms]\r\n");
         logsys::printf("  sine <s> <usteps> [dir] [period_ms]\r\n");
         logsys::printf("  const <s> <usteps> [dir]\r\n");
         break;
     case command::Type::Status:
         for (size_t i = 0; i < kMotorCount; ++i) {
-            auto* drv = motors[i].driver;
-            if (!drv)
+            auto* profile = motors[i].profile;
+            if (!profile)
                 continue;
-            uint32_t value = 0;
-            if (drv->read(tmc2130::Reg::DRV_STATUS, value)) {
-                logsys::printf("[STATUS][M%u] 0x%08lX (SPI=0x%02X)\r\n",
-                    static_cast<unsigned>(i), value,
-                    static_cast<unsigned>(drv->lastStatus()));
-            } else {
-                logsys::printf("[STATUS][M%u] read failed\r\n",
-                    static_cast<unsigned>(i));
-            }
+            const float velocity = profile->lastVelocity();
+            const char* dir = (profile->lastDirection() == motion::Direction::Forward)
+                ? "FWD"
+                : "REV";
+            logsys::printf("[STATUS][M%u] velocity=%.1f usteps/s dir=%s steps=%lu\r\n",
+                static_cast<unsigned>(i), velocity, dir,
+                static_cast<unsigned long>(profile->lastStepCount()));
         }
         break;
     case command::Type::Stop:
@@ -263,6 +162,16 @@ void process_command()
         });
         break;
     }
+    case command::Type::Run:
+        for_each_motor("RUN", [&](motion::MotionProfile& p) {
+            return cmd.peak > 0.f ? p.runForever(cmd.peak, cmd.direction) : p.stop();
+        });
+        break;
+    case command::Type::Speed:
+        for_each_motor("SPEED", [&](motion::MotionProfile& p) {
+            return p.updateVelocity(cmd.peak, cmd.direction);
+        });
+        break;
     case command::Type::Scurve:
         for_each_motor("SCURVE", [&](motion::MotionProfile& p) {
             return p.runSCurve(cmd.duration, cmd.peak, cmd.direction,
@@ -307,9 +216,23 @@ void process_command()
 
 } // namespace
 
+extern "C" void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef* htim)
+{
+    if (!htim || htim->Instance != TIM2)
+        return;
+
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+        if (kMotorCount > 0 && g_profiles[0])
+            g_profiles[0]->handleTimerEvent();
+    } else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+        if (kMotorCount > 1 && g_profiles[1])
+            g_profiles[1]->handleTimerEvent();
+    }
+}
+
 static void print_banner()
 {
-    uart2_write("\r\n=== TMC2130 SPI Demo ===\r\n");
+    uart2_write("\r\n=== TMC2209 Step Demo ===\r\n");
 }
 
 int main()
@@ -317,30 +240,28 @@ int main()
     HAL_Init();
 
     SystemClock_Config();
-    MX_SPI1_Init();
     //MX_I2C1_Init();
     MX_USART2_UART_Init();
-    //MX_TIM2_Init();
+    MX_TIM2_Init();
     MX_GPIO_Init();
-    // BlinkyLED();
+    BlinkyLED();
 
     logsys::init(&huart2);
     print_banner();
     logsys::printf("[BOOT] Ready.\r\n");
 
-    // configure_cs_pins();
     init_motor_contexts();
 
     while (true) {
         handle_uart_input();
         process_command();
 
-        // static uint32_t last_blink = 0;
-        // uint32_t now = HAL_GetTick();
-        // if (now - last_blink >= kBlinkIntervalMs) {
-        //     HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
-        //     last_blink = now;
-        // }
+        static uint32_t last_blink = 0;
+        uint32_t now = HAL_GetTick();
+        if (now - last_blink >= kBlinkIntervalMs) {
+             HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
+             last_blink = now;
+        }
  
         HAL_Delay(1);
     }

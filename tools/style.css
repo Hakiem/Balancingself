@@ -1,0 +1,91 @@
+<style type="text/css">
+body {
+    font-family: system-ui, sans-serif;
+    background: #10131a;
+    color: #e0e6f8;
+    margin: 0;
+    padding: 1.5rem;
+}
+
+h1 {
+    margin-top: 0;
+    font-size: 1.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12rem;
+}
+
+.status {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.badge {
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+}
+
+.badge.off {
+    background: #422;
+    color: #f7c6c6;
+}
+
+.badge.on {
+    background: #1f5139;
+    color: #c8f5d1;
+}
+
+fieldset {
+    border: 1px solid #343c55;
+    border-radius: 6px;
+    margin-bottom: 1.5rem;
+    padding: 1rem;
+}
+
+legend {
+    padding: 0 0.5rem;
+    font-weight: 600;
+}
+
+.controls,
+.presets {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+}
+
+button,
+input {
+    background: #1c2333;
+    color: #e0e6f8;
+    border: 1px solid #343c55;
+    border-radius: 4px;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.95rem;
+}
+
+button:hover {
+    background: #27324d;
+    cursor: pointer;
+}
+
+textarea {
+    background: #0b0e16;
+    color: #d8def0;
+    border: 1px solid #343c55;
+    border-radius: 4px;
+    width: 100%;
+    min-height: 16rem;
+    padding: 0.75rem;
+    box-sizing: border-box;
+    font-family: 'Fira Code', monospace;
+    font-size: 0.9rem;
+}
+
+.preset-buttons button {
+    background: #1f273d;
+}
+</style>

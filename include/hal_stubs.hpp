@@ -11,6 +11,7 @@ struct SPI_HandleTypeDef {
 };
 
 struct TIM_HandleTypeDef {
+    uint32_t Channel = 0;
 };
 
 struct GPIO_TypeDef {
@@ -53,12 +54,25 @@ inline HAL_StatusTypeDef HAL_SPI_TransmitReceive(
 }
 
 inline HAL_StatusTypeDef HAL_TIM_Base_Start(TIM_HandleTypeDef*) { return HAL_OK; }
+inline HAL_StatusTypeDef HAL_TIM_OC_Start_IT(TIM_HandleTypeDef*, uint32_t) { return HAL_OK; }
+inline HAL_StatusTypeDef HAL_TIM_OC_Stop_IT(TIM_HandleTypeDef*, uint32_t) { return HAL_OK; }
 
 inline void HAL_Delay(uint32_t) { }
 
 inline void __NOP() { }
 
-#define __HAL_TIM_SET_COUNTER(timer, value) (void)(timer), (void)(value)
-#define __HAL_TIM_GET_COUNTER(timer) (0u)
+inline void __HAL_TIM_SET_COUNTER(TIM_HandleTypeDef*, uint32_t) { }
+inline uint32_t __HAL_TIM_GET_COUNTER(TIM_HandleTypeDef*) { return 0u; }
+inline void __HAL_TIM_SET_COMPARE(TIM_HandleTypeDef*, uint32_t, uint32_t) { }
+inline uint32_t __HAL_TIM_GET_COMPARE(TIM_HandleTypeDef*, uint32_t) { return 0u; }
+inline uint32_t __HAL_TIM_GET_ACTIVE_CHANNEL(TIM_HandleTypeDef* htim)
+{
+    return htim ? htim->Channel : 0u;
+}
+
+#define TIM_CHANNEL_1 0x00000001u
+#define TIM_CHANNEL_2 0x00000002u
+#define HAL_TIM_ACTIVE_CHANNEL_1 TIM_CHANNEL_1
+#define HAL_TIM_ACTIVE_CHANNEL_2 TIM_CHANNEL_2
 
 #endif // UNIT_TEST

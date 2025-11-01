@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>STM32 Serial Console</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            background: #10131a;
+            color: #e0e6f8;
+            margin: 0;
+            padding: 1.5rem;
+        }
+
+        h1 {
+            margin-top: 0;
+            font-size: 1.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12rem;
+        }
+
+        .controls, .presets, .status {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+
+        button, select, input {
+            background: #1c2333;
+            color: #e0e6f8;
+            border: 1px solid #343c55;
+            border-radius: 4px;
+            padding: 0.45rem 0.9rem;
+            font-size: 0.95rem;
+        }
+
+        button:hover {
+            background: #27324d;
+            cursor: pointer;
+        }
+
+        textarea {
+            background: #0b0e16;
+            color: #d8def0;
+            border: 1px solid #343c55;
+            border-radius: 4px;
+            width: 100%;
+            min-height: 16rem;
+            padding: 0.75rem;
+            box-sizing: border-box;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.9rem;
+        }
+
+        .badge {
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+        }
+
+        .badge.off {
+            background: #422;
+            color: #f7c6c6;
+        }
+
+        .badge.on {
+            background: #1f5139;
+            color: #c8f5d1;
+        }
+
+        fieldset {
+            border: 1px solid #343c55;
+            border-radius: 6px;
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+        }
+
+        legend {
+            padding: 0 0.5rem;
+            font-weight: 600;
+        }
+
+        label {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .preset-buttons button {
+            background: #1f273d;
+        }
+    </style>
+</head>
+<body>
+    <h1>STM32 Stepper Console</h1>
+
+    <div class="status">
+        <span id="connection-status" class="badge off">Disconnected</span>
+        <span id="port-info"></span>
+    </div>
+
+    <fieldset>
+        <legend>Connection</legend>
+        <div class="controls">
+            <select id="port-select">
+                <option value="">Select or request port…</option>
+            </select>
+            <button id="request-port">Request Port</button>
+            <button id="connect">Connect</button>
+            <button id="disconnect" disabled>Disconnect</button>
+
+            <label title="Defaults to 115200 if left blank">
+                Baud
+                <input id="baud" type="number" min="1200" value="115200" step="1200">
+            </label>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Quick Commands</legend>
+        <div class="presets preset-buttons">
+            <button data-cmd="help">help</button>
+            <button data-cmd="status">status</button>
+            <button data-cmd="stop">stop</button>
+            <button data-cmd="run 2000 fwd">run 2000 fwd</button>
+            <button data-cmd="speed 4000">speed 4000</button>
+            <button data-cmd="trapezoid 0.5 2 0.5 8000 fwd 10">trapezoid ramp</button>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Send Command</legend>
+        <div class="controls">
+            <input id="command-input" type="text" placeholder="Type command (e.g. run 2000 fwd)" style="flex: 1 1 auto;">
+            <button id="send-command">Send</button>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Console</legend>
+        <textarea id="console" readonly placeholder="Serial output appears here..."></textarea>
+        <div class="controls">
+            <button id="clear-console">Clear</button>
+            <label>
+                <input id="echo-input" type="checkbox" checked>
+                Echo commands to console
+            </label>
+            <label>
+                Line ending
+                <select id="line-ending">
+                    <option value="crlf" selected>CR + LF</option>
+                    <option value="cr">CR</option>
+                    <option value="lf">LF</option>
+                    <option value="none">None</option>
+                </select>
+            </label>
+        </div>
+    </fieldset>
+
+    <script>
+        const requestPortBtn = document.getElementById('request-port');
+        const portSelect = document.getElementById('port-select');
+        const connectBtn = document.getElementById('connect');
+        const disconnectBtn = document.getElementById('disconnect');
+        const portInfo = document.getElementById('port-info');
+        const statusBadge = document.getElementById('connection-status');
+        const consoleArea = document.getElementById('console');
+        const sendBtn = document.getElementById('send-command');
+        const cmdInput = document.getElementById('command-input');
+        const clearBtn = document.getElementById('clear-console');
+        const baudInput = document.getElementById('baud');
+        const echoCheckbox = document.getElementById('echo-input');
+        const presetButtons = document.querySelectorAll('.preset-buttons button');
+        const lineEndingSelect = document.getElementById('line-ending');
+
+        let port;
+        let reader;
+        let writer;
+        let keepReading = false;
+        let readBuffer = '';
+        const decoder = new TextDecoder();
+
+        function log(message) {
+            consoleArea.value += message + '\n';
+            consoleArea.scrollTop = consoleArea.scrollHeight;
+            console.log('[serial]', message);
+        }
+
+        function setStatus(connected, info = '') {
+            statusBadge.textContent = connected ? 'Connected' : 'Disconnected';
+            statusBadge.className = connected ? 'badge on' : 'badge off';
+            portInfo.textContent = info;
+            disconnectBtn.disabled = !connected;
+            connectBtn.disabled = connected;
+        }
+
+        async function refreshPorts() {
+            if (!('serial' in navigator))
+                return;
+            try {
+                const ports = await navigator.serial.getPorts();
+                portSelect.innerHTML = '';
+                if (!ports.length) {
+                    const opt = document.createElement('option');
+                    opt.value = '';
+                    opt.textContent = 'No remembered ports';
+                    portSelect.appendChild(opt);
+                    connectBtn.disabled = true;
+                    return;
+                }
+                ports.forEach((p, idx) => {
+                    const info = p.getInfo();
+                    const opt = document.createElement('option');
+                    opt.value = idx;
+                    opt.textContent = `VID ${info.usbVendorId || '??'} / PID ${info.usbProductId || '??'}`;
+                    opt.dataset.index = idx;
+                    portSelect.appendChild(opt);
+                });
+                portSelect.selectedIndex = 0;
+                connectBtn.disabled = false;
+                storedPorts = ports;
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        let storedPorts = [];
+
+        async function readLoop() {
+            while (port && port.readable && keepReading) {
+                try {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    if (value) {
+                        const chunk = decoder.decode(value, { stream: true })
+                            .replace(/\r\n/g, '\n')
+                            .replace(/\r/g, '\n');
+                        readBuffer += chunk;
+                        const lines = readBuffer.split('\n');
+                        readBuffer = lines.pop() ?? '';
+                        lines.forEach(line => log(line));
+                    }
+                } catch (err) {
+                    log('[error] ' + err.message);
+                    break;
+                }
+            }
+        }
+
+        requestPortBtn.addEventListener('click', async () => {
+            if (!('serial' in navigator)) {
+                log('[error] Web Serial API not supported. Use Chrome/Edge over HTTPS.');
+                return;
+            }
+
+            try {
+                const newPort = await navigator.serial.requestPort();
+                const info = newPort.getInfo();
+                log(`[info] Added port VID ${info.usbVendorId || '??'} PID ${info.usbProductId || '??'}`);
+                await refreshPorts();
+            } catch (err) {
+                log('[error] ' + err.message);
+            }
+        });
+
+        connectBtn.addEventListener('click', async () => {
+            if (!('serial' in navigator)) {
+                log('[error] Web Serial API not supported. Use Chrome/Edge over HTTPS.');
+                return;
+            }
+
+            try {
+                if (!storedPorts.length)
+                    await refreshPorts();
+
+                if (!storedPorts.length) {
+                    log('[warn] No stored ports. Click "Request Port" first.');
+                    return;
+                }
+
+                const selectedIdx = portSelect.selectedIndex;
+                if (selectedIdx < 0) {
+                    log('[warn] Select a port or request a new one.');
+                    return;
+                }
+
+                port = storedPorts[selectedIdx];
+                const baudRate = Number(baudInput.value) || 115200;
+                await port.open({ baudRate });
+                //try {
+                //    await port.setSignals({ dataTerminalReady: true, requestToSend: true });
+                //} catch (_) { }
+
+                const info = port.getInfo();
+                setStatus(true, `USB VID: ${info.usbVendorId || 'N/A'}, PID: ${info.usbProductId || 'N/A'}, ${baudRate} baud`);
+
+                reader = port.readable.getReader();
+                writer = port.writable.getWriter();
+                keepReading = true;
+                readLoop().catch(err => log('[error] ' + err.message));
+                log('[info] Connected');
+            } catch (err) {
+                log('[error] ' + err.message);
+            }
+        });
+
+        disconnectBtn.addEventListener('click', async () => {
+            await disconnect();
+        });
+
+        async function disconnect() {
+            try {
+                keepReading = false;
+                if (reader) {
+                    await reader.cancel();
+                    reader.releaseLock();
+                    reader = null;
+                }
+                if (writer) {
+                    await writer.close();
+                    writer.releaseLock();
+                    writer = null;
+                }
+                if (port) {
+                    await port.close();
+                    port = null;
+                }
+                if (readBuffer) {
+                    log(readBuffer);
+                    readBuffer = '';
+                }
+                setStatus(false);
+                log('[info] Disconnected');
+            } catch (err) {
+                log('[error] ' + err.message);
+            }
+        }
+
+        async function sendCommand(cmd) {
+            if (!writer) {
+                log('[warn] Not connected');
+                return;
+            }
+            const text = cmd.trim();
+            if (!text)
+                return;
+            try {
+                const encoder = new TextEncoder();
+                let payload = encoder.encode(text);
+
+                const ending = lineEndingSelect.value;
+                if (ending !== 'none') {
+                    const endingBytes = ending === 'crlf'
+                        ? Uint8Array.of(13, 10)
+                        : ending === 'cr'
+                            ? Uint8Array.of(13)
+                            : Uint8Array.of(10);
+                    const merged = new Uint8Array(payload.length + endingBytes.length);
+                    merged.set(payload, 0);
+                    merged.set(endingBytes, payload.length);
+                    payload = merged;
+                }
+
+                console.log('[serial cmd]', text, Array.from(payload).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
+                await writer.write(payload);
+                if (echoCheckbox.checked) {
+                    log('> ' + text);
+                }
+            } catch (err) {
+                log('[error] ' + err.message);
+            }
+        }
+
+        sendBtn.addEventListener('click', () => {
+            sendCommand(cmdInput.value);
+            cmdInput.value = '';
+            cmdInput.focus();
+        });
+
+        cmdInput.addEventListener('keydown', (evt) => {
+            if (evt.key === 'Enter') {
+                evt.preventDefault();
+                sendBtn.click();
+            }
+        });
+
+        clearBtn.addEventListener('click', () => {
+            consoleArea.value = '';
+        });
+
+        presetButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                sendCommand(btn.dataset.cmd);
+            });
+        });
+
+        window.addEventListener('beforeunload', async () => {
+            await disconnect();
+        });
+
+        if ('serial' in navigator) {
+            refreshPorts();
+            navigator.serial.addEventListener('connect', refreshPorts);
+            navigator.serial.addEventListener('disconnect', async () => {
+                await refreshPorts();
+                if (port && !storedPorts.includes(port)) {
+                    await disconnect();
+                }
+            });
+        } else {
+            log('[error] Web Serial API not supported in this browser.');
+        }
+    </script>
+</body>
+</html>
