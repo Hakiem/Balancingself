@@ -1,11 +1,11 @@
 #pragma once
 
+#include "TMC5160_regs.hpp"
 #include "spi_bridge.hpp"
-#include "tmc5160_bits.hpp"
-#include "tmc5160_registers.hpp"
 #include <cstdint>
 
-namespace tmc5160 {
+namespace tmc5160
+{
 
 class Motor
 {
@@ -40,6 +40,7 @@ public:
         bool diag0_on_otpw = true;
         bool diag1_on_stall = false;
         bool stop_enable = false;
+        bool fast_standstill = false;
 
         uint8_t ihold = 16;
         uint8_t irun = 31;
@@ -60,8 +61,8 @@ public:
         uint8_t pwm_ampl = 128;
         uint8_t pwm_grad = 4;
         uint8_t pwm_freq = 1;
-        bool pwm_autoscale = true;
-        bool pwm_symmetric = false;
+        bool enable_pwm_autoscale = true;
+        bool enable_pwm_autograd = false;
         uint8_t pwm_freewheel = 0;
 
         uint8_t global_scaler = 0; ///< 0 disables write.
@@ -102,14 +103,16 @@ public:
 
     bool setMicrosteps(uint16_t microsteps, const Config& cfg_template);
     bool setCurrent(uint8_t irun, uint8_t ihold, uint8_t ihold_delay);
-    bool setVelocity(float microsteps_per_second, Direction dir, uint32_t clock_hz);
+    bool setVelocity(
+        float microsteps_per_second, Direction dir, uint32_t clock_hz);
     bool stop(uint32_t clock_hz);
 
     uint8_t lastStatus() const { return last_status_; }
 
 private:
     bool datagram(const uint8_t tx[5], uint8_t* rx = nullptr);
-    static uint32_t velocityToReg(float microsteps_per_second, uint32_t clock_hz);
+    static uint32_t velocityToReg(
+        float microsteps_per_second, uint32_t clock_hz);
     void handleStatus(uint8_t status);
 
     SPI_Bridge& spi_;
@@ -119,24 +122,29 @@ private:
 
 inline bool Motor::write(Reg reg, uint32_t value)
 {
-    uint8_t tx[5] = {
-        static_cast<uint8_t>(0x80u | static_cast<uint8_t>(reg)),
-        static_cast<uint8_t>(value >> 24),
-        static_cast<uint8_t>(value >> 16),
-        static_cast<uint8_t>(value >> 8),
-        static_cast<uint8_t>(value) };
+    uint8_t tx[5] = { static_cast<uint8_t>(0x80u | static_cast<uint8_t>(reg)),
+        static_cast<uint8_t>(value >> 24), static_cast<uint8_t>(value >> 16),
+        static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value) };
     return datagram(tx);
 }
 
 inline bool Motor::read(Reg reg, uint32_t& value)
 {
-    uint8_t tx[5] = { static_cast<uint8_t>(reg), 0, 0, 0, 0 };
+    // Send read command (register address without MSB set)
+    uint8_t addr = static_cast<uint8_t>(reg);
+    uint8_t tx[5] = { addr, 0, 0, 0, 0 };
+    
+    // First datagram gets status + old data
     uint8_t first[5] = {};
     if (!datagram(tx, first))
         return false;
+
+    // Second datagram gets status + requested data
     uint8_t second[5] = {};
     if (!datagram(tx, second))
         return false;
+
+    // Extract the data from the response
     value = (uint32_t(second[1]) << 24) | (uint32_t(second[2]) << 16)
         | (uint32_t(second[3]) << 8) | uint32_t(second[4]);
     return true;
@@ -162,7 +170,8 @@ inline void Motor::handleStatus(uint8_t status)
         status_cb_(status);
 }
 
-inline uint32_t Motor::velocityToReg(float microsteps_per_second, uint32_t clock_hz)
+inline uint32_t Motor::velocityToReg(
+    float microsteps_per_second, uint32_t clock_hz)
 {
     if (microsteps_per_second <= 0.f || clock_hz == 0u)
         return 0u;
@@ -179,16 +188,30 @@ inline uint32_t Motor::velocityToReg(float microsteps_per_second, uint32_t clock
 inline bool Motor::initialize(const Config& cfg)
 {
     if (cfg.write_gconf) {
-        uint32_t gconf = detail::makeGconf(cfg.enable_stealthchop,
-            cfg.use_internal_rsense, cfg.invert_direction, cfg.diag0_on_error,
-            cfg.diag0_on_otpw, cfg.diag1_on_stall, cfg.stop_enable);
+        uint32_t gconf = 0;
+        if (cfg.enable_stealthchop)
+            gconf = GCONF::EN_PWM_MODE.set(gconf, 1);
+        if (cfg.fast_standstill)
+            gconf = GCONF::FASTSTANDSTILL.set(gconf, 1);
+        if (cfg.invert_direction)
+            gconf = GCONF::SHAFT.set(gconf, 1);
+        if (cfg.diag0_on_error)
+            gconf = GCONF::DIAG0_ERROR.set(gconf, 1);
+        if (cfg.diag0_on_otpw)
+            gconf = GCONF::DIAG0_OTPW.set(gconf, 1);
+        if (cfg.diag1_on_stall)
+            gconf = GCONF::DIAG1_STALL_or_DIR.set(gconf, 1);
+        if (cfg.stop_enable)
+            gconf = GCONF::STOP_ENABLE.set(gconf, 1);
         if (!write(Reg::GCONF, gconf))
             return false;
     }
 
     if (cfg.write_ihold_irun) {
-        uint32_t ihold_irun = detail::encodeIHOLDIRUN(
-            cfg.ihold, cfg.irun, cfg.ihold_delay);
+        uint32_t ihold_irun = 0;
+        ihold_irun = IHOLD_IRUN::IHOLD.set(ihold_irun, cfg.ihold);
+        ihold_irun = IHOLD_IRUN::IRUN.set(ihold_irun, cfg.irun);
+        ihold_irun = IHOLD_IRUN::IHOLDDELAY.set(ihold_irun, cfg.ihold_delay);
         if (!write(Reg::IHOLD_IRUN, ihold_irun))
             return false;
     }
@@ -199,17 +222,31 @@ inline bool Motor::initialize(const Config& cfg)
     }
 
     if (cfg.write_chopconf) {
-        uint32_t chopconf = detail::makeChopconf(cfg.toff, cfg.hend, cfg.hstrt,
-            cfg.blank_time, cfg.high_vsense, cfg.enable_spreadcycle,
-            cfg.enable_interpolation, cfg.double_edge_step,
-            cfg.disable_s2g_protection, cfg.microsteps);
+        uint32_t chopconf = 0;
+        chopconf = CHOPCONF::TOFF.set(chopconf, cfg.toff);
+        chopconf = CHOPCONF::HEND.set(chopconf, cfg.hend);
+        chopconf = CHOPCONF::HSTRT.set(chopconf, cfg.hstrt);
+        chopconf = CHOPCONF::TBL.set(chopconf, cfg.blank_time);
+        chopconf = SHORT_CONF::VSENSE.set(chopconf, cfg.high_vsense ? 1 : 0);
+        chopconf = CHOPCONF::CHM.set(chopconf, !cfg.enable_spreadcycle);
+        chopconf = CHOPCONF::INTPOL.set(chopconf, cfg.enable_interpolation);
+        chopconf = CHOPCONF::DEDGE.set(chopconf, cfg.double_edge_step);
+        chopconf = CHOPCONF::DISS2G.set(chopconf, cfg.disable_s2g_protection);
+        chopconf
+            = set_mres(chopconf, static_cast<MicrostepRes>(cfg.microsteps));
         if (!write(Reg::CHOPCONF, chopconf))
             return false;
     }
 
     if (cfg.write_pwmconf) {
-        uint32_t pwmconf = detail::makePwmconf(cfg.pwm_ampl, cfg.pwm_grad,
-            cfg.pwm_freq, cfg.pwm_autoscale, cfg.pwm_symmetric, cfg.pwm_freewheel);
+        uint32_t pwmconf = 0;
+        pwmconf = PWMCONF::PWM_OFS.set(pwmconf, cfg.pwm_ampl);
+        pwmconf = PWMCONF::PWM_GRAD.set(pwmconf, cfg.pwm_grad);
+        pwmconf = PWMCONF::PWM_FREQ.set(pwmconf, cfg.pwm_freq);
+        pwmconf = PWMCONF::PWM_AUTOSCALE.set(
+            pwmconf, cfg.enable_pwm_autoscale ? 1 : 0);
+        pwmconf = PWMCONF::PWM_AUTOGRAD.set(
+            pwmconf, cfg.enable_pwm_autograd ? 1 : 0);
         if (!write(Reg::PWMCONF, pwmconf))
             return false;
     }
@@ -275,7 +312,7 @@ inline bool Motor::initialize(const Config& cfg)
             return false;
     }
 
-    if (!write(Reg::RAMPMODE, RAMPMODE_HOLD))
+    if (!write(Reg::RAMPMODE, static_cast<uint32_t>(RAMPMODE::Mode::HOLD)))
         return false;
     if (!write(Reg::VMAX, 0))
         return false;
@@ -283,7 +320,8 @@ inline bool Motor::initialize(const Config& cfg)
     return true;
 }
 
-inline bool Motor::setMicrosteps(uint16_t microsteps, const Config& cfg_template)
+inline bool Motor::setMicrosteps(
+    uint16_t microsteps, const Config& cfg_template)
 {
     Config cfg = cfg_template;
     cfg.microsteps = microsteps;
@@ -311,17 +349,22 @@ inline bool Motor::setMicrosteps(uint16_t microsteps, const Config& cfg_template
 
 inline bool Motor::setCurrent(uint8_t irun, uint8_t ihold, uint8_t ihold_delay)
 {
-    uint32_t value = detail::encodeIHOLDIRUN(ihold, irun, ihold_delay);
+    uint32_t value = 0;
+    value = IHOLD_IRUN::IHOLD.set(value, ihold);
+    value = IHOLD_IRUN::IRUN.set(value, irun);
+    value = IHOLD_IRUN::IHOLDDELAY.set(value, ihold_delay);
     return write(Reg::IHOLD_IRUN, value);
 }
 
-inline bool Motor::setVelocity(float microsteps_per_second, Direction dir, uint32_t clock_hz)
+inline bool Motor::setVelocity(
+    float microsteps_per_second, Direction dir, uint32_t clock_hz)
 {
     uint32_t vmax = velocityToReg(microsteps_per_second, clock_hz);
     if (!write(Reg::VMAX, vmax))
         return false;
-    uint32_t mode = (dir == Direction::Forward) ? RAMPMODE_VELOCITY_POS
-                                                : RAMPMODE_VELOCITY_NEG;
+    uint32_t mode = (dir == Direction::Forward)
+        ? static_cast<uint32_t>(RAMPMODE::Mode::VEL_POS)
+        : static_cast<uint32_t>(RAMPMODE::Mode::VEL_NEG);
     return write(Reg::RAMPMODE, mode);
 }
 
@@ -330,7 +373,7 @@ inline bool Motor::stop(uint32_t clock_hz)
     (void)clock_hz;
     if (!write(Reg::VMAX, 0))
         return false;
-    return write(Reg::RAMPMODE, RAMPMODE_HOLD);
+    return write(Reg::RAMPMODE, static_cast<uint32_t>(RAMPMODE::Mode::HOLD));
 }
 
 } // namespace tmc5160

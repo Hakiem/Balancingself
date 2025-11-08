@@ -48,11 +48,8 @@ void printf(const char* format, ...)
     va_end(args);
 
     if (len > 0) {
-        size_t to_send = (len < static_cast<int>(sizeof(buffer)))
-            ? len
-            : sizeof(buffer) - 1;
         g_transmitter(g_huart, reinterpret_cast<uint8_t*>(buffer),
-            static_cast<uint16_t>(to_send), HAL_MAX_DELAY);
+            static_cast<uint16_t>(len), HAL_MAX_DELAY);
     }
 }
 

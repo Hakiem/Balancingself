@@ -1,13 +1,17 @@
+#include "main.h"
 #include "board.hpp"
 #include "command_processor.hpp"
 #include "logger.hpp"
-#include "main.h"
 #include "motion_types.hpp"
 #include "tmc5160_motor.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+
+using std::lround;
+using std::max;
+using std::min;
 
 extern "C" {
 I2C_HandleTypeDef hi2c1;
@@ -16,7 +20,8 @@ TIM_HandleTypeDef htim2;
 SPI_HandleTypeDef hspi1;
 }
 
-namespace {
+namespace
+{
 
 constexpr uint32_t kBlinkIntervalMs = 1000;
 
@@ -69,8 +74,8 @@ tmc5160::Motor::Config make_default_config()
     cfg.pwm_ampl = 128;
     cfg.pwm_grad = 4;
     cfg.pwm_freq = 1;
-    cfg.pwm_autoscale = true;
-    cfg.pwm_symmetric = false;
+    cfg.enable_pwm_autoscale = true;
+    cfg.enable_pwm_autograd = false;
     cfg.pwm_freewheel = 0;
     cfg.write_tpwmthrs = false;
     cfg.write_tcoolthrs = false;
@@ -94,12 +99,14 @@ tmc5160::Motor* acquire_motor(size_t index)
 {
     switch (index) {
     case 0: {
-        static SPI_Bridge bridge(&hspi1, kChipSelects[0].port, kChipSelects[0].pin);
+        static SPI_Bridge bridge(
+            &hspi1, kChipSelects[0].port, kChipSelects[0].pin);
         static tmc5160::Motor motor(bridge);
         return &motor;
     }
     case 1: {
-        static SPI_Bridge bridge(&hspi1, kChipSelects[1].port, kChipSelects[1].pin);
+        static SPI_Bridge bridge(
+            &hspi1, kChipSelects[1].port, kChipSelects[1].pin);
         static tmc5160::Motor motor(bridge);
         return &motor;
     }
@@ -152,8 +159,7 @@ void handle_uart_input()
     }
 }
 
-template <typename Fn>
-void for_each_motor(const char* tag, Fn&& fn)
+template <typename Fn> void for_each_motor(const char* tag, Fn&& fn)
 {
     for (size_t i = 0; i < kMotorCount; ++i) {
         auto& ctx = motors[i];
@@ -183,12 +189,14 @@ uint16_t sanitize_microsteps(uint32_t requested)
     }
 }
 
-bool apply_velocity(MotorContext& ctx, float velocity_usteps_s, motion::Direction dir)
+bool apply_velocity(
+    MotorContext& ctx, float velocity_usteps_s, motion::Direction dir)
 {
     if (!ctx.driver)
         return false;
     const float magnitude = std::fabs(velocity_usteps_s);
-    if (!ctx.driver->setVelocity(magnitude, to_driver_direction(dir), ctx.cfg.clock_frequency_hz))
+    if (!ctx.driver->setVelocity(
+            magnitude, to_driver_direction(dir), ctx.cfg.clock_frequency_hz))
         return false;
     ctx.last_velocity = magnitude;
     ctx.last_direction = dir;
@@ -231,25 +239,91 @@ void init_motor_contexts()
             continue;
         }
 
-        if (!ctx.driver->initialize(ctx.cfg)) {
-            logsys::printf("[SETUP][M%u] SPI init failed\r\n",
+        // Debug print register addresses and raw values
+        uint8_t gconf_addr = static_cast<uint8_t>(tmc5160::Reg::GCONF);
+        uint8_t ioin_addr = static_cast<uint8_t>(tmc5160::Reg::IOIN);
+        logsys::printf("[DEBUG][M%u] GCONF=0x%02X IOIN=0x%02X\r\n",
+            static_cast<unsigned>(i), gconf_addr, ioin_addr);
+
+        // Try to read GCONF first to verify basic SPI communication
+        uint32_t gconf = 0;
+        if (!ctx.driver->read(tmc5160::Reg::GCONF, gconf)) {
+            logsys::printf("[SETUP][M%u] Initial GCONF read failed - Check SPI "
+                           "connections\r\n",
                 static_cast<unsigned>(i));
             continue;
         }
 
+        logsys::printf("[SETUP][M%u] GCONF=0x%08lX\r\n",
+            static_cast<unsigned>(i), static_cast<unsigned long>(gconf));
+
+        // Now try to initialize the driver
+        if (!ctx.driver->initialize(ctx.cfg)) {
+            logsys::printf("[SETUP][M%u] Driver initialization failed\r\n",
+                static_cast<unsigned>(i));
+            continue;
+        }
+
+        // Read and validate IOIN register
         uint32_t ioin = 0;
+        bool init_ok = false;
+
         if (ctx.driver->read(tmc5160::Reg::IOIN, ioin)) {
-            const uint8_t version = static_cast<uint8_t>(ioin >> 24);
-            logsys::printf("[IOIN][M%u] value=0x%08lX VERSION=0x%02X\r\n",
-                static_cast<unsigned>(i),
-                static_cast<unsigned long>(ioin),
-                static_cast<unsigned>(version));
+            const uint8_t version
+                = static_cast<uint8_t>(tmc5160::IOIN::VERSION.get(ioin));
+            const bool en = tmc5160::IOIN::DRV_ENN.get(ioin);
+
+            logsys::printf("[IOIN][M%u] value=0x%08lX VERSION=0x%02X %s %s\r\n",
+                static_cast<unsigned>(i), static_cast<unsigned long>(ioin),
+                static_cast<unsigned>(version),
+                (version == 0x30) ? "[VERSION OK]"
+                                  : "[BAD VERSION - Expected 0x30]",
+                !en ? "[POWER OK]" : "[NO POWER - Check 12V]");
+
+            // Only continue if version is correct and power is present
+            if (version == 0x30) {
+                if (!en) {
+                    init_ok = true;
+                } else {
+                    logsys::printf(
+                        "[INIT][M%u] Driver power not detected (DRV_ENN=1)\r\n",
+                        static_cast<unsigned>(i));
+                }
+            } else {
+                logsys::printf(
+                    "[INIT][M%u] Invalid version 0x%02X (expected 0x30)\r\n",
+                    static_cast<unsigned>(i), static_cast<unsigned>(version));
+            }
         } else {
-            logsys::printf("[IOIN][M%u] read failed\r\n", static_cast<unsigned>(i));
+            logsys::printf(
+                "[IOIN][M%u] read failed - Check SPI connections\r\n",
+                static_cast<unsigned>(i));
+        }
+
+        // If initialization failed, clear the driver pointer
+        if (!init_ok) {
+            ctx.driver = nullptr;
         }
     }
 
-    logsys::printf("[INIT] TMC5160 drivers ready.\r\n");
+    // Check if any drivers initialized successfully
+    size_t ready_count = 0;
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        if (motors[i].driver != nullptr) {
+            ++ready_count;
+        }
+    }
+
+    const char* status = "failed to initialize";
+    if (ready_count == kMotorCount) {
+        status = "ready";
+    } else if (ready_count > 0) {
+        status = "partially ready";
+    }
+
+    logsys::printf("[INIT] TMC5160 drivers %s (%u/%u)\r\n", status,
+        static_cast<unsigned>(ready_count),
+        static_cast<unsigned>(kMotorCount));
 }
 
 void print_status()
@@ -259,23 +333,51 @@ void print_status()
         if (!ctx.driver)
             continue;
 
+        // Read registers
         uint32_t vactual = 0;
-        bool have_vel = ctx.driver->read(tmc5160::Reg::VACTUAL, vactual);
-        float velocity = have_vel ? decode_velocity(vactual, ctx.cfg.clock_frequency_hz) : 0.f;
-
         uint32_t drv_status = 0;
-        bool have_drv = ctx.driver->read(tmc5160::Reg::DRV_STATUS, drv_status);
-        const uint32_t sg_result = drv_status & tmc5160::DRV_STATUS_SG_RESULT_MASK;
-        const uint32_t cs_actual = (drv_status & tmc5160::DRV_STATUS_CS_ACTUAL_MASK) >> 16;
+        uint32_t ioin = 0;
+
+        ctx.driver->read(tmc5160::Reg::VACTUAL, vactual);
+        ctx.driver->read(tmc5160::Reg::DRV_STATUS, drv_status);
+        ctx.driver->read(tmc5160::Reg::IOIN, ioin);
+
+        // Process readings
+        float velocity = decode_velocity(vactual, ctx.cfg.clock_frequency_hz);
+        uint32_t sg_result = tmc5160::DRV_STATUS::SG_RESULT.get(drv_status);
+        uint32_t cs_actual = tmc5160::DRV_STATUS::CS_ACTUAL.get(drv_status);
+
+        // Print status
+        const char* dir_str = (ctx.last_direction == motion::Direction::Forward)
+            ? "FWD"
+            : "REV";
+        const char* timed_str = ctx.timed_move ? "yes" : "no";
+
+        logsys::printf("[STATUS][M%u] v=%.1f usteps/s dir=%s timed=%s\r\n",
+            static_cast<unsigned>(i), velocity, dir_str, timed_str);
+
+        logsys::printf("    DRV: 0x%08lX sg=%lu cs=%lu\r\n",
+            (unsigned long)drv_status, (unsigned long)sg_result,
+            (unsigned long)cs_actual);
+
+        // Print IO pin states with validation
+        auto step = tmc5160::IOIN::REFL_STEP.get(ioin);
+        auto dir = tmc5160::IOIN::REFR_DIR.get(ioin);
+        auto en = tmc5160::IOIN::DRV_ENN.get(ioin);
+        auto mode = tmc5160::IOIN::SD_MODE.get(ioin);
+        auto version = tmc5160::IOIN::VERSION.get(ioin);
+
+        // Expected version for TMC5160 is 0x30
+        bool version_ok = (version == 0x30);
+        bool power_ok
+            = !en; // DRV_ENN is active low, so !en means power is good
 
         logsys::printf(
-            "[STATUS][M%u] v=%.1f usteps/s dir=%s timed=%s drv=0x%08lX sg=%lu cs=%lu\r\n",
-            static_cast<unsigned>(i), velocity,
-            (ctx.last_direction == motion::Direction::Forward) ? "FWD" : "REV",
-            ctx.timed_move ? "yes" : "no",
-            have_drv ? static_cast<unsigned long>(drv_status) : 0ul,
-            static_cast<unsigned long>(sg_result),
-            static_cast<unsigned long>(cs_actual));
+            "    IO:  STEP=%lu DIR=%lu EN=%lu MODE=%lu VER=0x%02lX  %s %s\r\n",
+            (unsigned long)step, (unsigned long)dir, (unsigned long)en,
+            (unsigned long)mode, (unsigned long)version,
+            version_ok ? "[VERSION OK]" : "[BAD VERSION - Expected 0x30]",
+            power_ok ? "[POWER OK]" : "[NO POWER - Check 12V]");
     }
 }
 
@@ -317,16 +419,19 @@ void process_command()
         break;
 
     case command::Type::SetAmplitude: {
-        const float clamped = std::clamp(cmd.amplitude, 0.f, 255.f);
+        const float clamped = (cmd.amplitude < 0.f)
+            ? 0.f
+            : (cmd.amplitude > 255.f ? 255.f : cmd.amplitude);
         const float scale = clamped / 255.f;
-        const int irun = static_cast<int>(std::lround(scale * 31.f));
-        const int ihold = std::max(1, irun / 2);
+        const int irun = static_cast<int>(scale * 31.f + 0.5f);
+        const int ihold = (irun / 2 < 1) ? 1 : (irun / 2);
         for_each_motor("CUR", [&](MotorContext& ctx, size_t) {
             if (!ctx.driver)
                 return false;
             ctx.cfg.irun = static_cast<uint8_t>(irun);
             ctx.cfg.ihold = static_cast<uint8_t>(ihold);
-            return ctx.driver->setCurrent(ctx.cfg.irun, ctx.cfg.ihold, ctx.cfg.ihold_delay);
+            return ctx.driver->setCurrent(
+                ctx.cfg.irun, ctx.cfg.ihold, ctx.cfg.ihold_delay);
         });
         break;
     }
@@ -344,7 +449,7 @@ void process_command()
 
     case command::Type::Run:
     case command::Type::Speed: {
-        const float velocity = std::max(cmd.peak, 0.f);
+        const float velocity = (cmd.peak < 0.f) ? 0.f : cmd.peak;
         const motion::Direction dir = cmd.direction;
         for_each_motor("SPEED", [&](MotorContext& ctx, size_t) {
             if (!ctx.driver)
@@ -356,10 +461,10 @@ void process_command()
     }
 
     case command::Type::ConstantVelocity: {
-        const float velocity = std::max(cmd.peak, 0.f);
+        const float velocity = (cmd.peak < 0.f) ? 0.f : cmd.peak;
         const motion::Direction dir = cmd.direction;
-        const uint32_t duration_ms
-            = static_cast<uint32_t>((cmd.duration > 0.f ? cmd.duration : 0.f) * 1000.f);
+        const uint32_t duration_ms = static_cast<uint32_t>(
+            (cmd.duration > 0.f ? cmd.duration : 0.f) * 1000.f);
         for_each_motor("CONST", [&](MotorContext& ctx, size_t) {
             if (!ctx.driver)
                 return false;
@@ -381,7 +486,8 @@ void process_command()
     case command::Type::Trapezoid:
     case command::Type::Expo:
     case command::Type::Sine:
-        logsys::printf("[CMD] Profile commands are not supported in SPI velocity mode.\r\n");
+        logsys::printf("[CMD] Profile commands are not supported in SPI "
+                       "velocity mode.\r\n");
         break;
 
     case command::Type::None:
@@ -391,10 +497,7 @@ void process_command()
     }
 }
 
-void print_banner()
-{
-    uart2_write("\r\n=== TMC5160 SPI Demo ===\r\n");
-}
+void print_banner() { uart2_write("\r\n=== TMC5160 SPI Demo ===\r\n"); }
 
 } // namespace
 
@@ -412,9 +515,23 @@ int main()
     print_banner();
     logsys::printf("[BOOT] Ready.\r\n");
 
+    // Enable drivers and wait for power-up
     TMC_DriversEnable(true);
-    HAL_Delay(2);
+    HAL_Delay(500); // Increase power-up delay to 500ms
+
+    // Configure SPI at lower speed initially
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
+        Error_Handler();
+    }
+
     init_motor_contexts();
+
+    // After init, can increase SPI speed if needed
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
+        Error_Handler();
+    }
 
     uint32_t last_blink = 0;
 
