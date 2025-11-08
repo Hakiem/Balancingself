@@ -1,48 +1,134 @@
 #include "board.hpp"
+#include "command_processor.hpp"
 #include "logger.hpp"
 #include "main.h"
-#include "motion_profile.hpp"
-#include "command_processor.hpp"
+#include "motion_types.hpp"
+#include "tmc5160_motor.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
-#include <string.h>
 
 extern "C" {
 I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart2;
 TIM_HandleTypeDef htim2;
+SPI_HandleTypeDef hspi1;
 }
 
 namespace {
 
 constexpr uint32_t kBlinkIntervalMs = 1000;
 
+struct ChipSelect {
+    GPIO_TypeDef* port;
+    uint16_t pin;
+};
+
+const ChipSelect kChipSelects[] = {
+    { GPIOA, GPIO_PIN_0 },
+    { GPIOA, GPIO_PIN_1 },
+};
+
+constexpr size_t kMotorCount = sizeof(kChipSelects) / sizeof(kChipSelects[0]);
+
 struct MotorContext {
-    motion::MotionProfile* profile = nullptr;
+    tmc5160::Motor* driver = nullptr;
+    tmc5160::Motor::Config cfg {};
+    bool timed_move = false;
+    uint32_t deadline_ms = 0;
+    float last_velocity = 0.f;
+    motion::Direction last_direction = motion::Direction::Forward;
 };
-
-const motion::MotionProfile::StepPins kStepPins[] = {
-    { GPIOA, GPIO_PIN_0, GPIOB, GPIO_PIN_4, TIM_CHANNEL_1 },
-    { GPIOA, GPIO_PIN_1, GPIOB, GPIO_PIN_5, TIM_CHANNEL_2 },
-};
-
-constexpr size_t kMotorCount = sizeof(kStepPins) / sizeof(kStepPins[0]);
 
 MotorContext motors[kMotorCount];
-
-motion::MotionProfile* g_profiles[kMotorCount] = { nullptr };
-
-static_assert(sizeof(kStepPins) / sizeof(kStepPins[0]) == sizeof(motors) / sizeof(motors[0]),
-    "Mismatch between step pin table and motor context count");
 
 char cmd_buffer[128];
 uint8_t cmd_index = 0;
 bool cmd_ready = false;
 
+tmc5160::Motor::Config make_default_config()
+{
+    tmc5160::Motor::Config cfg;
+    cfg.enable_spreadcycle = false;
+    cfg.enable_stealthchop = true;
+    cfg.use_internal_rsense = false;
+    cfg.ihold = 16;
+    cfg.irun = 28;
+    cfg.ihold_delay = 6;
+    cfg.tpowerdown = 20;
+    cfg.microsteps = 256;
+    cfg.toff = 4;
+    cfg.hend = 1;
+    cfg.hstrt = 4;
+    cfg.blank_time = 2;
+    cfg.high_vsense = false;
+    cfg.enable_interpolation = true;
+    cfg.double_edge_step = false;
+    cfg.disable_s2g_protection = false;
+    cfg.pwm_ampl = 128;
+    cfg.pwm_grad = 4;
+    cfg.pwm_freq = 1;
+    cfg.pwm_autoscale = true;
+    cfg.pwm_symmetric = false;
+    cfg.pwm_freewheel = 0;
+    cfg.write_tpwmthrs = false;
+    cfg.write_tcoolthrs = false;
+    cfg.write_thigh = false;
+    cfg.write_global_scaler = false;
+    cfg.write_dcctrl = false;
+    cfg.write_a1 = false;
+    cfg.write_v1 = false;
+    cfg.write_d1 = false;
+    cfg.vstart = 0;
+    cfg.amax = 800;
+    cfg.dmax = 800;
+    cfg.vmax = 0;
+    cfg.vstop = 10;
+    cfg.tzerowait = 0;
+    cfg.clock_frequency_hz = 12000000;
+    return cfg;
+}
+
+tmc5160::Motor* acquire_motor(size_t index)
+{
+    switch (index) {
+    case 0: {
+        static SPI_Bridge bridge(&hspi1, kChipSelects[0].port, kChipSelects[0].pin);
+        static tmc5160::Motor motor(bridge);
+        return &motor;
+    }
+    case 1: {
+        static SPI_Bridge bridge(&hspi1, kChipSelects[1].port, kChipSelects[1].pin);
+        static tmc5160::Motor motor(bridge);
+        return &motor;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+tmc5160::Motor::Direction to_driver_direction(motion::Direction dir)
+{
+    return (dir == motion::Direction::Forward)
+        ? tmc5160::Motor::Direction::Forward
+        : tmc5160::Motor::Direction::Reverse;
+}
+
+float decode_velocity(uint32_t raw, uint32_t clock_hz)
+{
+    int32_t value = static_cast<int32_t>(raw & 0xFFFFFFu);
+    if (value & 0x800000u)
+        value |= ~0xFFFFFF;
+    double velocity = static_cast<double>(value) * static_cast<double>(clock_hz)
+        / static_cast<double>(1u << 24);
+    return static_cast<float>(velocity);
+}
+
 void uart2_write(const char* msg)
 {
     HAL_UART_Transmit(&huart2, reinterpret_cast<const uint8_t*>(msg),
-        static_cast<uint16_t>(strlen(msg)), HAL_MAX_DELAY);
+        static_cast<uint16_t>(std::strlen(msg)), HAL_MAX_DELAY);
 }
 
 void handle_uart_input()
@@ -70,34 +156,127 @@ template <typename Fn>
 void for_each_motor(const char* tag, Fn&& fn)
 {
     for (size_t i = 0; i < kMotorCount; ++i) {
-        auto* profile = motors[i].profile;
-        if (!profile)
+        auto& ctx = motors[i];
+        if (!ctx.driver)
             continue;
-        bool ok = fn(*profile);
+        bool ok = fn(ctx, i);
         logsys::printf("[%s][M%u] %s\r\n", tag, static_cast<unsigned>(i),
             ok ? "OK" : "FAIL");
     }
 }
 
+uint16_t sanitize_microsteps(uint32_t requested)
+{
+    switch (requested) {
+    case 1:
+    case 2:
+    case 4:
+    case 8:
+    case 16:
+    case 32:
+    case 64:
+    case 128:
+    case 256:
+        return static_cast<uint16_t>(requested);
+    default:
+        return 256;
+    }
+}
+
+bool apply_velocity(MotorContext& ctx, float velocity_usteps_s, motion::Direction dir)
+{
+    if (!ctx.driver)
+        return false;
+    const float magnitude = std::fabs(velocity_usteps_s);
+    if (!ctx.driver->setVelocity(magnitude, to_driver_direction(dir), ctx.cfg.clock_frequency_hz))
+        return false;
+    ctx.last_velocity = magnitude;
+    ctx.last_direction = dir;
+    return true;
+}
+
+void service_timed_moves()
+{
+    const uint32_t now = HAL_GetTick();
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        auto& ctx = motors[i];
+        if (!ctx.driver || !ctx.timed_move)
+            continue;
+        const int32_t delta = static_cast<int32_t>(now - ctx.deadline_ms);
+        if (delta >= 0) {
+            if (ctx.driver->stop(ctx.cfg.clock_frequency_hz)) {
+                logsys::printf("[STOP][M%u] timed run complete\r\n",
+                    static_cast<unsigned>(i));
+            }
+            ctx.timed_move = false;
+            ctx.last_velocity = 0.f;
+        }
+    }
+}
+
 void init_motor_contexts()
 {
-    static motion::MotionProfile prof0(kStepPins[0], &htim2);
-    motors[0] = MotorContext { &prof0 };
-    g_profiles[0] = &prof0;
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        MotorContext& ctx = motors[i];
+        ctx.driver = acquire_motor(i);
+        ctx.cfg = make_default_config();
+        ctx.timed_move = false;
+        ctx.deadline_ms = 0;
+        ctx.last_velocity = 0.f;
+        ctx.last_direction = motion::Direction::Forward;
 
-    if (kMotorCount > 1) {
-        static motion::MotionProfile prof1(kStepPins[1], &htim2);
-        motors[1] = MotorContext { &prof1 };
-        g_profiles[1] = &prof1;
+        if (!ctx.driver) {
+            logsys::printf("[SETUP][M%u] missing driver instance\r\n",
+                static_cast<unsigned>(i));
+            continue;
+        }
+
+        if (!ctx.driver->initialize(ctx.cfg)) {
+            logsys::printf("[SETUP][M%u] SPI init failed\r\n",
+                static_cast<unsigned>(i));
+            continue;
+        }
+
+        uint32_t ioin = 0;
+        if (ctx.driver->read(tmc5160::Reg::IOIN, ioin)) {
+            const uint8_t version = static_cast<uint8_t>(ioin >> 24);
+            logsys::printf("[IOIN][M%u] value=0x%08lX VERSION=0x%02X\r\n",
+                static_cast<unsigned>(i),
+                static_cast<unsigned long>(ioin),
+                static_cast<unsigned>(version));
+        } else {
+            logsys::printf("[IOIN][M%u] read failed\r\n", static_cast<unsigned>(i));
+        }
     }
 
-    for_each_motor("SETUP", [](motion::MotionProfile& p) {
-        p.setAmplitude(200.f);
-        p.setMicrostepResolution(256);
-        return true;
-    });
+    logsys::printf("[INIT] TMC5160 drivers ready.\r\n");
+}
 
-    logsys::printf("[INIT] Motion profiles ready.\r\n");
+void print_status()
+{
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        auto& ctx = motors[i];
+        if (!ctx.driver)
+            continue;
+
+        uint32_t vactual = 0;
+        bool have_vel = ctx.driver->read(tmc5160::Reg::VACTUAL, vactual);
+        float velocity = have_vel ? decode_velocity(vactual, ctx.cfg.clock_frequency_hz) : 0.f;
+
+        uint32_t drv_status = 0;
+        bool have_drv = ctx.driver->read(tmc5160::Reg::DRV_STATUS, drv_status);
+        const uint32_t sg_result = drv_status & tmc5160::DRV_STATUS_SG_RESULT_MASK;
+        const uint32_t cs_actual = (drv_status & tmc5160::DRV_STATUS_CS_ACTUAL_MASK) >> 16;
+
+        logsys::printf(
+            "[STATUS][M%u] v=%.1f usteps/s dir=%s timed=%s drv=0x%08lX sg=%lu cs=%lu\r\n",
+            static_cast<unsigned>(i), velocity,
+            (ctx.last_direction == motion::Direction::Forward) ? "FWD" : "REV",
+            ctx.timed_move ? "yes" : "no",
+            have_drv ? static_cast<unsigned long>(drv_status) : 0ul,
+            static_cast<unsigned long>(sg_result),
+            static_cast<unsigned long>(cs_actual));
+    }
 }
 
 void process_command()
@@ -110,7 +289,7 @@ void process_command()
 
     command::Command cmd = command::parse(cmd_buffer);
 
-switch (cmd.type) {
+    switch (cmd.type) {
     case command::Type::Help:
         logsys::printf("Commands:\r\n");
         logsys::printf("  help\r\n");
@@ -118,95 +297,93 @@ switch (cmd.type) {
         logsys::printf("  stop\r\n");
         logsys::printf("  amplitude <0..255>\r\n");
         logsys::printf("  microsteps <steps>\r\n");
-        logsys::printf("  run <usteps_s> [dir]\r\n");
         logsys::printf("  speed <usteps_s> [dir]\r\n");
-        logsys::printf("  scurve <s> <usteps> [dir] [period_ms]\r\n");
-        logsys::printf("  triangle <s> <usteps> [dir] [period_ms]\r\n");
-        logsys::printf("  trapezoid <accel> <const> <decel> <usteps> [dir] [period_ms]\r\n");
-        logsys::printf("  expo <s> <usteps> [steep] [dir] [period_ms]\r\n");
-        logsys::printf("  sine <s> <usteps> [dir] [period_ms]\r\n");
-        logsys::printf("  const <s> <usteps> [dir]\r\n");
+        logsys::printf("  run <usteps_s> [dir]\r\n");
+        logsys::printf("  const <seconds> <usteps_s> [dir]\r\n");
         break;
+
     case command::Type::Status:
-        for (size_t i = 0; i < kMotorCount; ++i) {
-            auto* profile = motors[i].profile;
-            if (!profile)
-                continue;
-            const float velocity = profile->lastVelocity();
-            const char* dir = (profile->lastDirection() == motion::Direction::Forward)
-                ? "FWD"
-                : "REV";
-            logsys::printf("[STATUS][M%u] velocity=%.1f usteps/s dir=%s steps=%lu\r\n",
-                static_cast<unsigned>(i), velocity, dir,
-                static_cast<unsigned long>(profile->lastStepCount()));
-        }
+        print_status();
         break;
+
     case command::Type::Stop:
-        for_each_motor("STOP", [](motion::MotionProfile& p) {
-            return p.stop();
+        for_each_motor("STOP", [](MotorContext& ctx, size_t) {
+            if (!ctx.driver)
+                return false;
+            ctx.timed_move = false;
+            ctx.last_velocity = 0.f;
+            return ctx.driver->stop(ctx.cfg.clock_frequency_hz);
         });
         break;
+
     case command::Type::SetAmplitude: {
-        float amp = (cmd.amplitude < 0.f) ? 0.f : cmd.amplitude;
-        for_each_motor("AMP", [amp](motion::MotionProfile& p) {
-            p.setAmplitude(amp);
-            return true;
+        const float clamped = std::clamp(cmd.amplitude, 0.f, 255.f);
+        const float scale = clamped / 255.f;
+        const int irun = static_cast<int>(std::lround(scale * 31.f));
+        const int ihold = std::max(1, irun / 2);
+        for_each_motor("CUR", [&](MotorContext& ctx, size_t) {
+            if (!ctx.driver)
+                return false;
+            ctx.cfg.irun = static_cast<uint8_t>(irun);
+            ctx.cfg.ihold = static_cast<uint8_t>(ihold);
+            return ctx.driver->setCurrent(ctx.cfg.irun, ctx.cfg.ihold, ctx.cfg.ihold_delay);
         });
         break;
     }
+
     case command::Type::SetMicrosteps: {
-        uint32_t ms = cmd.microsteps ? cmd.microsteps : 256u;
-        for_each_motor("MSTEPS", [ms](motion::MotionProfile& p) {
-            p.setMicrostepResolution(static_cast<uint16_t>(ms));
+        const uint16_t micro = sanitize_microsteps(cmd.microsteps);
+        for_each_motor("MSTEPS", [&](MotorContext& ctx, size_t) {
+            if (!ctx.driver)
+                return false;
+            ctx.cfg.microsteps = micro;
+            return ctx.driver->setMicrosteps(micro, ctx.cfg);
+        });
+        break;
+    }
+
+    case command::Type::Run:
+    case command::Type::Speed: {
+        const float velocity = std::max(cmd.peak, 0.f);
+        const motion::Direction dir = cmd.direction;
+        for_each_motor("SPEED", [&](MotorContext& ctx, size_t) {
+            if (!ctx.driver)
+                return false;
+            ctx.timed_move = false;
+            return apply_velocity(ctx, velocity, dir);
+        });
+        break;
+    }
+
+    case command::Type::ConstantVelocity: {
+        const float velocity = std::max(cmd.peak, 0.f);
+        const motion::Direction dir = cmd.direction;
+        const uint32_t duration_ms
+            = static_cast<uint32_t>((cmd.duration > 0.f ? cmd.duration : 0.f) * 1000.f);
+        for_each_motor("CONST", [&](MotorContext& ctx, size_t) {
+            if (!ctx.driver)
+                return false;
+            if (!apply_velocity(ctx, velocity, dir))
+                return false;
+            if (duration_ms > 0u) {
+                ctx.timed_move = true;
+                ctx.deadline_ms = HAL_GetTick() + duration_ms;
+            } else {
+                ctx.timed_move = false;
+            }
             return true;
         });
         break;
     }
-    case command::Type::Run:
-        for_each_motor("RUN", [&](motion::MotionProfile& p) {
-            return cmd.peak > 0.f ? p.runForever(cmd.peak, cmd.direction) : p.stop();
-        });
-        break;
-    case command::Type::Speed:
-        for_each_motor("SPEED", [&](motion::MotionProfile& p) {
-            return p.updateVelocity(cmd.peak, cmd.direction);
-        });
-        break;
+
     case command::Type::Scurve:
-        for_each_motor("SCURVE", [&](motion::MotionProfile& p) {
-            return p.runSCurve(cmd.duration, cmd.peak, cmd.direction,
-                cmd.period_ms ? cmd.period_ms : 10);
-        });
-        break;
     case command::Type::Triangle:
-        for_each_motor("TRIANGLE", [&](motion::MotionProfile& p) {
-            return p.runTriangular(cmd.duration, cmd.peak, cmd.direction,
-                cmd.period_ms ? cmd.period_ms : 10);
-        });
-        break;
     case command::Type::Trapezoid:
-        for_each_motor("TRAP", [&](motion::MotionProfile& p) {
-            return p.runTrapezoidal(cmd.accel, cmd.constant, cmd.decel, cmd.peak,
-                cmd.direction, cmd.period_ms ? cmd.period_ms : 10);
-        });
-        break;
     case command::Type::Expo:
-        for_each_motor("EXPO", [&](motion::MotionProfile& p) {
-            return p.runExponential(cmd.duration, cmd.peak, cmd.steep, cmd.direction,
-                cmd.period_ms ? cmd.period_ms : 10);
-        });
-        break;
     case command::Type::Sine:
-        for_each_motor("SINE", [&](motion::MotionProfile& p) {
-            return p.runSinusoidal(cmd.duration, cmd.peak, cmd.direction,
-                cmd.period_ms ? cmd.period_ms : 10);
-        });
+        logsys::printf("[CMD] Profile commands are not supported in SPI velocity mode.\r\n");
         break;
-    case command::Type::ConstantVelocity:
-        for_each_motor("CONST", [&](motion::MotionProfile& p) {
-            return p.runConstantVelocity(cmd.duration, cmd.peak, cmd.direction);
-        });
-        break;
+
     case command::Type::None:
     default:
         logsys::printf("[CMD] Unknown. Type 'help'.\r\n");
@@ -214,55 +391,44 @@ switch (cmd.type) {
     }
 }
 
+void print_banner()
+{
+    uart2_write("\r\n=== TMC5160 SPI Demo ===\r\n");
+}
+
 } // namespace
-
-extern "C" void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef* htim)
-{
-    if (!htim || htim->Instance != TIM2)
-        return;
-
-    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-        if (kMotorCount > 0 && g_profiles[0])
-            g_profiles[0]->handleTimerEvent();
-    } else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-        if (kMotorCount > 1 && g_profiles[1])
-            g_profiles[1]->handleTimerEvent();
-    }
-}
-
-static void print_banner()
-{
-    uart2_write("\r\n=== TMC2209 Step Demo ===\r\n");
-}
 
 int main()
 {
     HAL_Init();
-
     SystemClock_Config();
-    //MX_I2C1_Init();
-    MX_USART2_UART_Init();
-    MX_TIM2_Init();
+
     MX_GPIO_Init();
+    MX_SPI1_Init();
+    MX_USART2_UART_Init();
     BlinkyLED();
 
     logsys::init(&huart2);
     print_banner();
     logsys::printf("[BOOT] Ready.\r\n");
 
+    TMC_DriversEnable(true);
+    HAL_Delay(2);
     init_motor_contexts();
+
+    uint32_t last_blink = 0;
 
     while (true) {
         handle_uart_input();
         process_command();
+        service_timed_moves();
 
-        static uint32_t last_blink = 0;
-        uint32_t now = HAL_GetTick();
+        const uint32_t now = HAL_GetTick();
         if (now - last_blink >= kBlinkIntervalMs) {
-             HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
-             last_blink = now;
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            last_blink = now;
         }
- 
+
         HAL_Delay(1);
     }
 }
