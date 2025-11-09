@@ -133,7 +133,7 @@ inline bool Motor::read(Reg reg, uint32_t& value)
     // Send read command (register address without MSB set)
     uint8_t addr = static_cast<uint8_t>(reg);
     uint8_t tx[5] = { addr, 0, 0, 0, 0 };
-    
+
     // First datagram gets status + old data
     uint8_t first[5] = {};
     if (!datagram(tx, first))
@@ -314,8 +314,6 @@ inline bool Motor::initialize(const Config& cfg)
 
     if (!write(Reg::RAMPMODE, static_cast<uint32_t>(RAMPMODE::Mode::HOLD)))
         return false;
-    if (!write(Reg::VMAX, 0))
-        return false;
 
     return true;
 }
@@ -359,13 +357,30 @@ inline bool Motor::setCurrent(uint8_t irun, uint8_t ihold, uint8_t ihold_delay)
 inline bool Motor::setVelocity(
     float microsteps_per_second, Direction dir, uint32_t clock_hz)
 {
+    // Calculate VMAX register value
     uint32_t vmax = velocityToReg(microsteps_per_second, clock_hz);
-    if (!write(Reg::VMAX, vmax))
-        return false;
+
+    // Set RAMPMODE first, then VMAX (order matters for TMC5160)
     uint32_t mode = (dir == Direction::Forward)
         ? static_cast<uint32_t>(RAMPMODE::Mode::VEL_POS)
         : static_cast<uint32_t>(RAMPMODE::Mode::VEL_NEG);
-    return write(Reg::RAMPMODE, mode);
+    if (!write(Reg::RAMPMODE, mode))
+        return false;
+
+    // Write VMAX
+    if (!write(Reg::VMAX, vmax))
+        return false;
+
+    // Verify the write by reading back
+    uint32_t readback = 0;
+    if (read(Reg::VMAX, readback)) {
+        if (readback != vmax) {
+            // Mismatch - try writing again
+            return write(Reg::VMAX, vmax);
+        }
+    }
+
+    return true;
 }
 
 inline bool Motor::stop(uint32_t clock_hz)

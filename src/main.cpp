@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 
 using std::lround;
@@ -86,8 +87,8 @@ tmc5160::Motor::Config make_default_config()
     cfg.write_v1 = false;
     cfg.write_d1 = false;
     cfg.vstart = 0;
-    cfg.amax = 800;
-    cfg.dmax = 800;
+    cfg.amax = 5000;
+    cfg.dmax = 5000;
     cfg.vmax = 0;
     cfg.vstop = 10;
     cfg.tzerowait = 0;
@@ -195,9 +196,26 @@ bool apply_velocity(
     if (!ctx.driver)
         return false;
     const float magnitude = std::fabs(velocity_usteps_s);
+
+    // Calculate expected VMAX register value for debugging
+    double expected_vmax = static_cast<double>(magnitude) * (1ull << 24)
+        / static_cast<double>(ctx.cfg.clock_frequency_hz);
+    uint32_t vmax_reg = static_cast<uint32_t>(expected_vmax);
+
+    logsys::printf(
+        "[DEBUG] setVelocity: vel=%.0f clock=%lu vmax_reg=0x%08lX\r\n",
+        magnitude, (unsigned long)ctx.cfg.clock_frequency_hz,
+        (unsigned long)vmax_reg);
+
     if (!ctx.driver->setVelocity(
             magnitude, to_driver_direction(dir), ctx.cfg.clock_frequency_hz))
         return false;
+
+    // Read back VMAX to verify
+    uint32_t readback = ctx.driver->read(tmc5160::Reg::VMAX);
+    logsys::printf(
+        "[DEBUG] VMAX readback=0x%08lX\r\n", (unsigned long)readback);
+
     ctx.last_velocity = magnitude;
     ctx.last_direction = dir;
     return true;
@@ -278,7 +296,8 @@ void init_motor_contexts()
                 static_cast<unsigned>(version),
                 (version == 0x30) ? "[VERSION OK]"
                                   : "[BAD VERSION - Expected 0x30]",
-                !en ? "[POWER OK]" : "[NO POWER - Check 12V]");
+                !en ? "[POWER OK]"
+                    : "[NO POWER - Check VMO is its switched on]");
 
             // Only continue if version is correct and power is present
             if (version == 0x30) {
@@ -322,8 +341,7 @@ void init_motor_contexts()
     }
 
     logsys::printf("[INIT] TMC5160 drivers %s (%u/%u)\r\n", status,
-        static_cast<unsigned>(ready_count),
-        static_cast<unsigned>(kMotorCount));
+        static_cast<unsigned>(ready_count), static_cast<unsigned>(kMotorCount));
 }
 
 void print_status()
@@ -344,6 +362,7 @@ void print_status()
 
         // Process readings
         float velocity = decode_velocity(vactual, ctx.cfg.clock_frequency_hz);
+        const long velocity_int = lround(velocity);
         uint32_t sg_result = tmc5160::DRV_STATUS::SG_RESULT.get(drv_status);
         uint32_t cs_actual = tmc5160::DRV_STATUS::CS_ACTUAL.get(drv_status);
 
@@ -353,31 +372,184 @@ void print_status()
             : "REV";
         const char* timed_str = ctx.timed_move ? "yes" : "no";
 
-        logsys::printf("[STATUS][M%u] v=%.1f usteps/s dir=%s timed=%s\r\n",
-            static_cast<unsigned>(i), velocity, dir_str, timed_str);
+        logsys::printf("[STATUS][M%u] v=%ld usteps/s dir=%s timed=%s\r\n",
+            static_cast<unsigned>(i), velocity_int, dir_str, timed_str);
 
         logsys::printf("    DRV: 0x%08lX sg=%lu cs=%lu\r\n",
             (unsigned long)drv_status, (unsigned long)sg_result,
             (unsigned long)cs_actual);
 
         // Print IO pin states with validation
-        auto step = tmc5160::IOIN::REFL_STEP.get(ioin);
-        auto dir = tmc5160::IOIN::REFR_DIR.get(ioin);
-        auto en = tmc5160::IOIN::DRV_ENN.get(ioin);
-        auto mode = tmc5160::IOIN::SD_MODE.get(ioin);
-        auto version = tmc5160::IOIN::VERSION.get(ioin);
+        const auto ref_step = tmc5160::IOIN::REFL_STEP.get(ioin);
+        const auto ref_dir = tmc5160::IOIN::REFR_DIR.get(ioin);
+        const auto step_pin = tmc5160::IOIN::STEP.get(ioin);
+        const auto dir_pin = tmc5160::IOIN::DIR.get(ioin);
+        const auto en = tmc5160::IOIN::DRV_ENN.get(ioin);
+        const auto mode = tmc5160::IOIN::SD_MODE.get(ioin);
+        const auto version = tmc5160::IOIN::VERSION.get(ioin);
 
         // Expected version for TMC5160 is 0x30
         bool version_ok = (version == 0x30);
         bool power_ok
             = !en; // DRV_ENN is active low, so !en means power is good
 
-        logsys::printf(
-            "    IO:  STEP=%lu DIR=%lu EN=%lu MODE=%lu VER=0x%02lX  %s %s\r\n",
-            (unsigned long)step, (unsigned long)dir, (unsigned long)en,
-            (unsigned long)mode, (unsigned long)version,
-            version_ok ? "[VERSION OK]" : "[BAD VERSION - Expected 0x30]",
-            power_ok ? "[POWER OK]" : "[NO POWER - Check 12V]");
+        const bool step_dir_enabled = (mode == 0);
+        if (step_dir_enabled) {
+            logsys::printf(
+                "    IO:  STEP_IN=%lu DIR_IN=%lu REF_STEP=%lu REF_DIR=%lu "
+                "EN=%lu MODE=%lu [STEP/DIR] VER=0x%02lX  %s %s\r\n",
+                (unsigned long)step_pin, (unsigned long)dir_pin,
+                (unsigned long)ref_step, (unsigned long)ref_dir,
+                (unsigned long)en, (unsigned long)mode, (unsigned long)version,
+                version_ok ? "[VERSION OK]" : "[BAD VERSION - Expected 0x30]",
+                power_ok ? "[POWER OK]" : "[NO POWER - Check 12V]");
+        } else {
+            logsys::printf(
+                "    IO:  REF_STEP=%lu REF_DIR=%lu EN=%lu MODE=%lu [SPI] "
+                "VER=0x%02lX  %s %s\r\n",
+                (unsigned long)ref_step, (unsigned long)ref_dir,
+                (unsigned long)en, (unsigned long)mode, (unsigned long)version,
+                version_ok ? "[VERSION OK]" : "[BAD VERSION - Expected 0x30]",
+                power_ok ? "[POWER OK]" : "[NO POWER - Check 12V]");
+            logsys::printf("         STEP/DIR interface disabled (velocity "
+                           "mode active)\r\n");
+        }
+    }
+}
+
+void log_drv_status(const char* tag)
+{
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        auto& ctx = motors[i];
+        if (!ctx.driver)
+            continue;
+        uint32_t drv_status = 0;
+        if (ctx.driver->read(tmc5160::Reg::DRV_STATUS, drv_status)) {
+            const auto sg = tmc5160::DRV_STATUS::SG_RESULT.get(drv_status);
+            const auto cs = tmc5160::DRV_STATUS::CS_ACTUAL.get(drv_status);
+            const auto stealth = tmc5160::DRV_STATUS::STEALTH.get(drv_status);
+            const auto fsactive = tmc5160::DRV_STATUS::FSACTIVE.get(drv_status);
+            const auto stst = tmc5160::DRV_STATUS::STST.get(drv_status);
+            const auto stall_guard
+                = tmc5160::DRV_STATUS::STALLGUARD.get(drv_status);
+            const auto ot = tmc5160::DRV_STATUS::OT.get(drv_status);
+            const auto otpw = tmc5160::DRV_STATUS::OTPW.get(drv_status);
+            const auto s2ga = tmc5160::DRV_STATUS::S2GA.get(drv_status);
+            const auto s2gb = tmc5160::DRV_STATUS::S2GB.get(drv_status);
+            const auto ola = tmc5160::DRV_STATUS::OLA.get(drv_status);
+            const auto olb = tmc5160::DRV_STATUS::OLB.get(drv_status);
+            const auto s2vsa = tmc5160::DRV_STATUS::S2VSA.get(drv_status);
+            const auto s2vsb = tmc5160::DRV_STATUS::S2VSB.get(drv_status);
+            logsys::printf(
+                "[%s][M%u] raw=0x%08lX sg=%lu cs=%lu stealth=%lu fs=%lu "
+                "stst=%lu stall=%lu ot=%lu otpw=%lu s2ga=%lu s2gb=%lu "
+                "ola=%lu olb=%lu s2vsa=%lu s2vsb=%lu\r\n",
+                tag, static_cast<unsigned>(i), (unsigned long)drv_status,
+                (unsigned long)sg, (unsigned long)cs, (unsigned long)stealth,
+                (unsigned long)fsactive, (unsigned long)stst,
+                (unsigned long)stall_guard, (unsigned long)ot,
+                (unsigned long)otpw, (unsigned long)s2ga, (unsigned long)s2gb,
+                (unsigned long)ola, (unsigned long)olb, (unsigned long)s2vsa,
+                (unsigned long)s2vsb);
+        } else {
+            logsys::printf("[%s][M%u] DRV_STATUS read failed\r\n", tag,
+                static_cast<unsigned>(i));
+        }
+    }
+}
+
+void log_motion_state(const char* tag)
+{
+    for (size_t i = 0; i < kMotorCount; ++i) {
+        auto& ctx = motors[i];
+        if (!ctx.driver)
+            continue;
+
+        uint32_t ramp_mode = 0;
+        const bool mode_ok
+            = ctx.driver->read(tmc5160::Reg::RAMPMODE, ramp_mode);
+        const char* mode_str = "UNKNOWN";
+        if (mode_ok) {
+            switch (ramp_mode & 0x3u) {
+            case 0:
+                mode_str = "POSITION";
+                break;
+            case 1:
+                mode_str = "VEL+";
+                break;
+            case 2:
+                mode_str = "VEL-";
+                break;
+            case 3:
+                mode_str = "HOLD";
+                break;
+            default:
+                break;
+            }
+        }
+
+        uint32_t ramp_stat = 0;
+        if (!ctx.driver->read(tmc5160::Reg::RAMP_STAT, ramp_stat)) {
+            logsys::printf(
+                "[%s][M%u] RAMPMODE=%s (raw=0x%08lX) RAMP_STAT read failed\r\n",
+                tag, static_cast<unsigned>(i), mode_str,
+                mode_ok ? (unsigned long)ramp_mode : 0ul);
+            continue;
+        }
+
+        const auto stop_l = tmc5160::RAMP_STAT::STATUS_STOP_L.get(ramp_stat);
+        const auto stop_r = tmc5160::RAMP_STAT::STATUS_STOP_R.get(ramp_stat);
+        const auto latch_l = tmc5160::RAMP_STAT::STATUS_LATCH_L.get(ramp_stat);
+        const auto latch_r = tmc5160::RAMP_STAT::STATUS_LATCH_R.get(ramp_stat);
+        const auto evt_stop_l = tmc5160::RAMP_STAT::EVENT_STOP_L.get(ramp_stat);
+        const auto evt_stop_r = tmc5160::RAMP_STAT::EVENT_STOP_R.get(ramp_stat);
+        const auto evt_stop_sg
+            = tmc5160::RAMP_STAT::EVENT_STOP_SG.get(ramp_stat);
+        const auto evt_pos
+            = tmc5160::RAMP_STAT::EVENT_POS_REACHED.get(ramp_stat);
+        const auto vel_reached
+            = tmc5160::RAMP_STAT::VELOCITY_REACHED.get(ramp_stat);
+        const auto pos_reached
+            = tmc5160::RAMP_STAT::POSITION_REACHED.get(ramp_stat);
+        const auto vzero = tmc5160::RAMP_STAT::VZERO.get(ramp_stat);
+
+        uint32_t vactual = 0;
+        bool vactual_ok = ctx.driver->read(tmc5160::Reg::VACTUAL, vactual);
+        const char* vact_str = "?";
+        char vact_buf[16];
+        if (vactual_ok) {
+            const float vel
+                = decode_velocity(vactual, ctx.cfg.clock_frequency_hz);
+            const long vactual_usteps = lround(vel);
+            snprintf(vact_buf, sizeof(vact_buf), "%ld", vactual_usteps);
+            vact_str = vact_buf;
+        }
+
+        uint32_t vmax_reg = 0;
+        bool vmax_ok = ctx.driver->read(tmc5160::Reg::VMAX, vmax_reg);
+        const char* vmax_str = "?";
+        char vmax_buf[32];
+        if (vmax_ok) {
+            const float vmax_vel
+                = decode_velocity(vmax_reg, ctx.cfg.clock_frequency_hz);
+            const long vmax_usteps = lround(vmax_vel);
+            snprintf(vmax_buf, sizeof(vmax_buf), "%ld (0x%lX)", vmax_usteps,
+                (unsigned long)vmax_reg);
+            vmax_str = vmax_buf;
+        }
+
+        logsys::printf("[%s][M%u] RAMPMODE=%s (0x%08lX) RAMP_STAT=0x%08lX "
+                       "stopL=%lu stopR=%lu latchL=%lu latchR=%lu "
+                       "eventL=%lu eventR=%lu eventSG=%lu posEvt=%lu vel=%lu "
+                       "pos=%lu vzero=%lu vact=%s vmax=%s\r\n",
+            tag, static_cast<unsigned>(i), mode_str,
+            mode_ok ? (unsigned long)ramp_mode : 0ul, (unsigned long)ramp_stat,
+            (unsigned long)stop_l, (unsigned long)stop_r,
+            (unsigned long)latch_l, (unsigned long)latch_r,
+            (unsigned long)evt_stop_l, (unsigned long)evt_stop_r,
+            (unsigned long)evt_stop_sg, (unsigned long)evt_pos,
+            (unsigned long)vel_reached, (unsigned long)pos_reached,
+            (unsigned long)vzero, vact_str, vmax_str);
     }
 }
 
@@ -481,20 +653,14 @@ void process_command()
         break;
     }
 
-    case command::Type::Scurve:
-    case command::Type::Triangle:
-    case command::Type::Trapezoid:
-    case command::Type::Expo:
-    case command::Type::Sine:
-        logsys::printf("[CMD] Profile commands are not supported in SPI "
-                       "velocity mode.\r\n");
-        break;
-
     case command::Type::None:
     default:
         logsys::printf("[CMD] Unknown. Type 'help'.\r\n");
         break;
     }
+
+    log_drv_status("DRV");
+    log_motion_state("RAMP");
 }
 
 void print_banner() { uart2_write("\r\n=== TMC5160 SPI Demo ===\r\n"); }

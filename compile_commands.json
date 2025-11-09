@@ -432,12 +432,6 @@
         "output": ".pio/build/nucleo_f303k8_mbed/FrameworkCMSISDevice/system_stm32f3xx.o"
     },
     {
-        "command": "/home/bob/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-g++ -o .pio/build/nucleo_f303k8_mbed/src/board.o -c -fno-rtti -fno-exceptions -Os -ffunction-sections -fdata-sections -specs=nano.specs -mthumb -mcpu=cortex-m4 -Os -ffunction-sections -fdata-sections -Wall -nostdlib -DPLATFORMIO=60118 -DSTM32F3 -DSTM32F303x8 -DUSE_HAL_DRIVER -DF_CPU=72000000L -Iinclude -Isrc -Isrc -Iinclude -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/CMSIS/Include -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/CMSIS/Device/ST/STM32F3xx/Include -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/STM32F3xx_HAL_Driver/Inc -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/STM32F3xx_HAL_Driver/Src -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/CMSIS/DSP/Include src/board.cpp",
-        "directory": "/home/bob/Documents/PlatformIO/Projects/STM32Test",
-        "file": "src/board.cpp",
-        "output": ".pio/build/nucleo_f303k8_mbed/src/board.o"
-    },
-    {
         "command": "/home/bob/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-g++ -o .pio/build/nucleo_f303k8_mbed/src/logger.o -c -fno-rtti -fno-exceptions -Os -ffunction-sections -fdata-sections -specs=nano.specs -mthumb -mcpu=cortex-m4 -Os -ffunction-sections -fdata-sections -Wall -nostdlib -DPLATFORMIO=60118 -DSTM32F3 -DSTM32F303x8 -DUSE_HAL_DRIVER -DF_CPU=72000000L -Iinclude -Isrc -Isrc -Iinclude -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/CMSIS/Include -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/CMSIS/Device/ST/STM32F3xx/Include -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/STM32F3xx_HAL_Driver/Inc -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/STM32F3xx_HAL_Driver/Src -I/home/bob/.platformio/packages/framework-stm32cubef3/Drivers/CMSIS/DSP/Include src/logger.cpp",
         "directory": "/home/bob/Documents/PlatformIO/Projects/STM32Test",
         "file": "src/logger.cpp",

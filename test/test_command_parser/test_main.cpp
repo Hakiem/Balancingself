@@ -16,15 +16,14 @@ TEST(CommandParser, ParsesAmplitude)
     EXPECT_NEAR(180.5f, cmd.amplitude, 0.001f);
 }
 
-TEST(CommandParser, ParsesScurveWithOptions)
+TEST(CommandParser, ParsesConstVelocity)
 {
-    char buf[] = "scurve 2.5 1200 rev 15";
+    char buf[] = "const 3.0 1500 rev";
     command::Command cmd = command::parse(buf);
-    EXPECT_EQ(command::Type::Scurve, cmd.type);
-    EXPECT_NEAR(2.5f, cmd.duration, 0.001f);
-    EXPECT_NEAR(1200.f, cmd.peak, 0.001f);
+    EXPECT_EQ(command::Type::ConstantVelocity, cmd.type);
+    EXPECT_NEAR(3.0f, cmd.duration, 0.001f);
+    EXPECT_NEAR(1500.f, cmd.peak, 0.001f);
     EXPECT_EQ(motion::Direction::Reverse, cmd.direction);
-    EXPECT_EQ(15u, cmd.period_ms);
 }
 
 TEST(CommandParser, UnknownFallback)

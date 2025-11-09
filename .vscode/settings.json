@@ -13,5 +13,9 @@
     "[c]": {
         "editor.defaultFormatter": "xaver.clang-format"
     },
+    "clangd.arguments": [
+  "--compile-commands-dir=${workspaceFolder}",
+  "--query-driver=/home/bob/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-*"
+]
     "CodeGPT.apiKey": "DeepSeek"
 }

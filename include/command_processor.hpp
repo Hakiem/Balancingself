@@ -17,11 +17,6 @@ enum class Type {
     SetMicrosteps,
     Run,
     Speed,
-    Scurve,
-    Triangle,
-    Trapezoid,
-    Expo,
-    Sine,
     ConstantVelocity
 };
 
@@ -29,15 +24,9 @@ struct Command {
     Type type = Type::None;
     float duration = 0.f;
     float peak = 0.f;
-    float accel = 0.f;
-    float constant = 0.f;
-    float decel = 0.f;
-    float steep = 0.f;
     float amplitude = 0.f;
-    uint32_t period_ms = 0;
     uint32_t microsteps = 0;
     motion::Direction direction = motion::Direction::Forward;
-    bool endless = false;
 };
 
 /**
@@ -148,7 +137,6 @@ inline Command parse(char* buffer)
         cmd.type = Type::Run;
         cmd.peak = speed;
         cmd.direction = dir;
-        cmd.endless = true;
         return cmd;
     }
     if (equals_ignore_case(token, "speed")) {
@@ -165,155 +153,6 @@ inline Command parse(char* buffer)
         cmd.type = Type::Speed;
         cmd.peak = speed;
         cmd.direction = dir;
-        return cmd;
-    }
-    if (equals_ignore_case(token, "scurve")) {
-        float duration = 0.f;
-        float peak = 0.f;
-        if (!parse_float_token(std::strtok(nullptr, " "), duration)
-            || !parse_float_token(std::strtok(nullptr, " "), peak))
-            return cmd;
-        motion::Direction dir = motion::Direction::Forward;
-        uint32_t period = 10;
-        char* next = std::strtok(nullptr, " ");
-        if (next) {
-            motion::Direction tmp;
-            if (parse_direction_token(next, tmp)) {
-                dir = tmp;
-                next = std::strtok(nullptr, " ");
-            }
-            if (next) {
-                uint32_t tmp_period;
-                if (parse_u32_token(next, tmp_period))
-                    period = tmp_period;
-            }
-        }
-        cmd.type = Type::Scurve;
-        cmd.duration = duration;
-        cmd.peak = peak;
-        cmd.direction = dir;
-        cmd.period_ms = period;
-        return cmd;
-    }
-    if (equals_ignore_case(token, "triangle")) {
-        float duration = 0.f;
-        float peak = 0.f;
-        if (!parse_float_token(std::strtok(nullptr, " "), duration)
-            || !parse_float_token(std::strtok(nullptr, " "), peak))
-            return cmd;
-        motion::Direction dir = motion::Direction::Forward;
-        uint32_t period = 10;
-        char* next = std::strtok(nullptr, " ");
-        if (next) {
-            motion::Direction tmp;
-            if (parse_direction_token(next, tmp)) {
-                dir = tmp;
-                next = std::strtok(nullptr, " ");
-            }
-            if (next) {
-                uint32_t tmp_period;
-                if (parse_u32_token(next, tmp_period))
-                    period = tmp_period;
-            }
-        }
-        cmd.type = Type::Triangle;
-        cmd.duration = duration;
-        cmd.peak = peak;
-        cmd.direction = dir;
-        cmd.period_ms = period;
-        return cmd;
-    }
-    if (equals_ignore_case(token, "trapezoid")) {
-        float accel = 0.f, constant = 0.f, decel = 0.f, target = 0.f;
-        if (!parse_float_token(std::strtok(nullptr, " "), accel)
-            || !parse_float_token(std::strtok(nullptr, " "), constant)
-            || !parse_float_token(std::strtok(nullptr, " "), decel)
-            || !parse_float_token(std::strtok(nullptr, " "), target))
-            return cmd;
-        motion::Direction dir = motion::Direction::Forward;
-        uint32_t period = 10;
-        char* next = std::strtok(nullptr, " ");
-        if (next) {
-            motion::Direction tmp;
-            if (parse_direction_token(next, tmp)) {
-                dir = tmp;
-                next = std::strtok(nullptr, " ");
-            }
-            if (next) {
-                uint32_t tmp_period;
-                if (parse_u32_token(next, tmp_period))
-                    period = tmp_period;
-            }
-        }
-        cmd.type = Type::Trapezoid;
-        cmd.accel = accel;
-        cmd.constant = constant;
-        cmd.decel = decel;
-        cmd.peak = target;
-        cmd.direction = dir;
-        cmd.period_ms = period;
-        return cmd;
-    }
-    if (equals_ignore_case(token, "expo")) {
-        float duration = 0.f;
-        float peak = 0.f;
-        float steep = 4.0f;
-        if (!parse_float_token(std::strtok(nullptr, " "), duration)
-            || !parse_float_token(std::strtok(nullptr, " "), peak))
-            return cmd;
-        char* next = std::strtok(nullptr, " ");
-        if (next) {
-            parse_float_token(next, steep);
-            next = std::strtok(nullptr, " ");
-        }
-        motion::Direction dir = motion::Direction::Forward;
-        if (next) {
-            motion::Direction tmp;
-            if (parse_direction_token(next, tmp)) {
-                dir = tmp;
-                next = std::strtok(nullptr, " ");
-            }
-        }
-        uint32_t period = 10;
-        if (next) {
-            uint32_t tmp_period;
-            if (parse_u32_token(next, tmp_period))
-                period = tmp_period;
-        }
-        cmd.type = Type::Expo;
-        cmd.duration = duration;
-        cmd.peak = peak;
-        cmd.steep = steep;
-        cmd.direction = dir;
-        cmd.period_ms = period;
-        return cmd;
-    }
-    if (equals_ignore_case(token, "sine")) {
-        float duration = 0.f;
-        float peak = 0.f;
-        if (!parse_float_token(std::strtok(nullptr, " "), duration)
-            || !parse_float_token(std::strtok(nullptr, " "), peak))
-            return cmd;
-        motion::Direction dir = motion::Direction::Forward;
-        uint32_t period = 10;
-        char* next = std::strtok(nullptr, " ");
-        if (next) {
-            motion::Direction tmp;
-            if (parse_direction_token(next, tmp)) {
-                dir = tmp;
-                next = std::strtok(nullptr, " ");
-            }
-            if (next) {
-                uint32_t tmp_period;
-                if (parse_u32_token(next, tmp_period))
-                    period = tmp_period;
-            }
-        }
-        cmd.type = Type::Sine;
-        cmd.duration = duration;
-        cmd.peak = peak;
-        cmd.direction = dir;
-        cmd.period_ms = period;
         return cmd;
     }
     if (equals_ignore_case(token, "const")) {

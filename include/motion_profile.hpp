@@ -259,6 +259,7 @@ private:
 
         return true;
     }
+    0
     bool runRamp(float duration_s, float peak_usteps_s, Direction dir,
         uint32_t update_period_ms, bool accelerating)
     {
