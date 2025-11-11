@@ -13,9 +13,13 @@
     "[c]": {
         "editor.defaultFormatter": "xaver.clang-format"
     },
-    "clangd.arguments": [
-  "--compile-commands-dir=${workspaceFolder}",
-  "--query-driver=/home/bob/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-*"
-]
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.cStandard": "c11",
+    "C_Cpp.errorSquiggles": "enabled",
     "CodeGPT.apiKey": "DeepSeek"
 }
