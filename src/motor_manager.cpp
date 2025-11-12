@@ -40,20 +40,20 @@ namespace
         tmc5160::Motor::Config cfg;
 
         // Driver mode settings
-        cfg.enable_spreadcycle = false; // Use stealthChop (quieter)
-        cfg.enable_stealthchop = true;
+        cfg.enable_spreadcycle = true; // Use spreadCycle (more torque)
+        cfg.enable_stealthchop = false;
         cfg.use_internal_rsense = false; // External sense resistors
 
         // Current settings (out of 31 max)
-        cfg.ihold = 16; // Holding current
-        cfg.irun = 28; // Running current
+        cfg.ihold = 8; // Holding current (reduced for testing)
+        cfg.irun = 16; // Running current (reduced for testing)
         cfg.ihold_delay = 6; // Delay before reducing to hold current
         cfg.tpowerdown = 20; // Power down delay
 
         // Microstepping and chopper settings
         cfg.microsteps = 256; // 256 microsteps per full step
-        cfg.toff = 4; // Chopper off time
-        cfg.hend = 1; // Hysteresis end value
+        cfg.toff = 5; // Chopper off time (increased from 4)
+        cfg.hend = 5; // Hysteresis end value (increased from 1)
         cfg.hstrt = 4; // Hysteresis start value
         cfg.blank_time = 2; // Comparator blank time
         cfg.high_vsense = false; // Low sense resistor voltage
@@ -62,7 +62,8 @@ namespace
         cfg.double_edge_step = false;
         cfg.disable_s2g_protection = false;
 
-        // StealthChop PWM settings
+        // StealthChop PWM settings (not used in spreadCycle mode)
+        cfg.write_pwmconf = false; // Disable PWMCONF in spreadCycle mode
         cfg.pwm_ampl = 128; // PWM amplitude (autoscale will adjust)
         cfg.pwm_grad = 4; // PWM gradient
         cfg.pwm_freq = 1; // PWM frequency
@@ -80,7 +81,13 @@ namespace
         cfg.write_v1 = false;
         cfg.write_d1 = false;
 
-        // Ramp generator parameters
+        // Ramp generator parameters (explicitly enable writes)
+        cfg.write_vstart = true;
+        cfg.write_amax = true;
+        cfg.write_vmax = true;
+        cfg.write_dmax = true;
+        cfg.write_vstop = true;
+
         cfg.vstart = 0; // Start velocity (0 = start from standstill)
         cfg.amax = 5000; // Acceleration (increased for faster ramp-up)
         cfg.dmax = 5000; // Deceleration
@@ -210,7 +217,32 @@ void initialize()
             // present
             if (version == 0x30) {
                 if (!en) {
-                    init_ok = true;
+                    // Debug: Read back CHOPCONF to verify TOFF
+                    uint32_t chopconf = 0;
+                    if (ctx.driver->read(tmc5160::Reg::CHOPCONF, chopconf)) {
+                        uint32_t toff = chopconf & 0x0F; // TOFF is bits 0-3
+                        logsys::printf(
+                            "[DEBUG][M%u] CHOPCONF=0x%08lX TOFF=%lu %s\r\n",
+                            static_cast<unsigned>(i),
+                            static_cast<unsigned long>(chopconf),
+                            static_cast<unsigned long>(toff),
+                            (toff == 0) ? "[DRIVER DISABLED!]"
+                                        : "[DRIVER ENABLED]");
+
+                        // Only mark as initialized if TOFF is non-zero (driver
+                        // enabled)
+                        if (toff == 0) {
+                            init_ok = false;
+                            logsys::printf("[INIT][M%u] Driver disabled "
+                                           "(TOFF=0) - Check motor "
+                                           "wiring for shorts/opens\r\n",
+                                static_cast<unsigned>(i));
+                        } else {
+                            init_ok = true;
+                        }
+                    } else {
+                        init_ok = false;
+                    }
                 } else {
                     logsys::printf(
                         "[INIT][M%u] Driver power not detected (DRV_ENN=1)\r\n",

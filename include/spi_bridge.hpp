@@ -31,10 +31,7 @@ public:
      * @param cs_pin    GPIO pin for the chip-select signal.
      * @param timeout_ms Timeout applied to HAL transfers (default 10 ms).
      */
-    SPI_Bridge(
-        SPI_HandleTypeDef* spi,
-        GPIO_TypeDef* cs_port,
-        uint16_t cs_pin,
+    SPI_Bridge(SPI_HandleTypeDef* spi, GPIO_TypeDef* cs_port, uint16_t cs_pin,
         uint32_t timeout_ms = 10)
         : spi_(spi)
         , cs_port_(cs_port)
@@ -46,7 +43,8 @@ public:
     }
 
     /**
-     * @brief RAII helper that asserts CS on construction and releases on scope exit.
+     * @brief RAII helper that asserts CS on construction and releases on scope
+     * exit.
      */
     class ScopedSelect
     {
@@ -151,7 +149,8 @@ public:
             status = HAL_SPI_TransmitReceive(
                 spi_, const_cast<uint8_t*>(tx), rx, len, timeout_ms_);
         } else if (tx) {
-            status = HAL_SPI_Transmit(spi_, const_cast<uint8_t*>(tx), len, timeout_ms_);
+            status = HAL_SPI_Transmit(
+                spi_, const_cast<uint8_t*>(tx), len, timeout_ms_);
         } else if (rx) {
             status = HAL_SPI_Receive(spi_, rx, len, timeout_ms_);
         } else {
@@ -170,7 +169,10 @@ public:
     /**
      * @brief Convenience wrapper around @ref transfer for TX-only operations.
      */
-    bool transmit(const uint8_t* tx, size_t len) { return transfer(tx, nullptr, len); }
+    bool transmit(const uint8_t* tx, size_t len)
+    {
+        return transfer(tx, nullptr, len);
+    }
 
     /**
      * @brief Convenience wrapper around @ref transfer for RX-only operations.

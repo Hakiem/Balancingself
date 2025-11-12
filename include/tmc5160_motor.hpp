@@ -1,7 +1,9 @@
 #pragma once
 
 #include "TMC5160_regs.hpp"
+#include "logger.hpp"
 #include "spi_bridge.hpp"
+#include <cmath>
 #include <cstdint>
 
 namespace tmc5160
@@ -159,6 +161,12 @@ inline bool Motor::datagram(const uint8_t tx[5], uint8_t* rx)
     if (!spi_.transfer(tx, target, 5))
         return false;
 
+    // Debug: Log full SPI exchange
+    logsys::printf(
+        "[SPI] TX:[%02X %02X %02X %02X %02X] RX:[%02X %02X %02X %02X %02X]\r\n",
+        tx[0], tx[1], tx[2], tx[3], tx[4], target[0], target[1], target[2],
+        target[3], target[4]);
+
     handleStatus(target[0]);
     return true;
 }
@@ -187,6 +195,32 @@ inline uint32_t Motor::velocityToReg(
 
 inline bool Motor::initialize(const Config& cfg)
 {
+    // Read CHOPCONF before reset to see current state
+    uint32_t chopconf_before = 0;
+    read(Reg::CHOPCONF, chopconf_before);
+    logsys::printf("[RESET] CHOPCONF before reset: 0x%08lX (TOFF=%lu)\r\n",
+        (unsigned long)chopconf_before, 
+        (unsigned long)(chopconf_before & 0x0F));
+    
+    // Software reset: Write GCONF with RECALIBRATE bit to reset driver
+    logsys::printf("[RESET] Triggering TMC5160 reset...\r\n");
+    uint32_t reset_gconf = GCONF::RECALIBRATE.set(0, 1);
+    if (!write(Reg::GCONF, reset_gconf))
+        return false;
+    
+    // Wait for reset to complete (datasheet recommends ~200ms)
+    #ifndef UNIT_TEST
+    HAL_Delay(200);
+    #endif
+    
+    // Read CHOPCONF after reset - should be power-on default (0x10410150)
+    uint32_t chopconf_after = 0;
+    read(Reg::CHOPCONF, chopconf_after);
+    logsys::printf("[RESET] CHOPCONF after reset: 0x%08lX (TOFF=%lu) %s\r\n",
+        (unsigned long)chopconf_after,
+        (unsigned long)(chopconf_after & 0x0F),
+        (chopconf_after == 0x10410150) ? "[RESET OK]" : "[UNEXPECTED]");
+    
     if (cfg.write_gconf) {
         uint32_t gconf = 0;
         if (cfg.enable_stealthchop)
@@ -207,6 +241,29 @@ inline bool Motor::initialize(const Config& cfg)
             return false;
     }
 
+    // CRITICAL: Write CHOPCONF before IHOLD_IRUN to avoid driver disable
+    if (cfg.write_chopconf) {
+        uint32_t chopconf = 0;
+        chopconf = CHOPCONF::TOFF.set(chopconf, cfg.toff);
+        chopconf = CHOPCONF::HEND.set(chopconf, cfg.hend);
+        chopconf = CHOPCONF::HSTRT.set(chopconf, cfg.hstrt);
+        chopconf = CHOPCONF::TBL.set(chopconf, cfg.blank_time);
+        chopconf = SHORT_CONF::VSENSE.set(chopconf, cfg.high_vsense ? 1 : 0);
+        // CHM: 0=stealthChop/constantToff, 1=spreadCycle (classic chopper)
+        chopconf = CHOPCONF::CHM.set(chopconf, cfg.enable_spreadcycle ? 1 : 0);
+        chopconf = CHOPCONF::INTPOL.set(chopconf, cfg.enable_interpolation);
+        chopconf = CHOPCONF::DEDGE.set(chopconf, cfg.double_edge_step);
+        chopconf = CHOPCONF::DISS2G.set(chopconf, cfg.disable_s2g_protection);
+        chopconf
+            = set_mres(chopconf, static_cast<MicrostepRes>(cfg.microsteps));
+
+        // Write CHOPCONF twice - TMC5160 sometimes needs this for TOFF to stick
+        if (!write(Reg::CHOPCONF, chopconf))
+            return false;
+        if (!write(Reg::CHOPCONF, chopconf))
+            return false;
+    }
+
     if (cfg.write_ihold_irun) {
         uint32_t ihold_irun = 0;
         ihold_irun = IHOLD_IRUN::IHOLD.set(ihold_irun, cfg.ihold);
@@ -218,23 +275,6 @@ inline bool Motor::initialize(const Config& cfg)
 
     if (cfg.write_tpowerdown) {
         if (!write(Reg::TPOWERDOWN, cfg.tpowerdown))
-            return false;
-    }
-
-    if (cfg.write_chopconf) {
-        uint32_t chopconf = 0;
-        chopconf = CHOPCONF::TOFF.set(chopconf, cfg.toff);
-        chopconf = CHOPCONF::HEND.set(chopconf, cfg.hend);
-        chopconf = CHOPCONF::HSTRT.set(chopconf, cfg.hstrt);
-        chopconf = CHOPCONF::TBL.set(chopconf, cfg.blank_time);
-        chopconf = SHORT_CONF::VSENSE.set(chopconf, cfg.high_vsense ? 1 : 0);
-        chopconf = CHOPCONF::CHM.set(chopconf, !cfg.enable_spreadcycle);
-        chopconf = CHOPCONF::INTPOL.set(chopconf, cfg.enable_interpolation);
-        chopconf = CHOPCONF::DEDGE.set(chopconf, cfg.double_edge_step);
-        chopconf = CHOPCONF::DISS2G.set(chopconf, cfg.disable_s2g_protection);
-        chopconf
-            = set_mres(chopconf, static_cast<MicrostepRes>(cfg.microsteps));
-        if (!write(Reg::CHOPCONF, chopconf))
             return false;
     }
 
@@ -360,25 +400,20 @@ inline bool Motor::setVelocity(
     // Calculate VMAX register value
     uint32_t vmax = velocityToReg(microsteps_per_second, clock_hz);
 
-    // Set RAMPMODE first, then VMAX (order matters for TMC5160)
+    // Set RAMPMODE first (order matters for TMC5160)
     uint32_t mode = (dir == Direction::Forward)
         ? static_cast<uint32_t>(RAMPMODE::Mode::VEL_POS)
         : static_cast<uint32_t>(RAMPMODE::Mode::VEL_NEG);
     if (!write(Reg::RAMPMODE, mode))
         return false;
 
+    // CRITICAL: Write AMAX unconditionally (must be set for velocity mode)
+    if (!write(Reg::AMAX, 5000))
+        return false;
+
     // Write VMAX
     if (!write(Reg::VMAX, vmax))
         return false;
-
-    // Verify the write by reading back
-    uint32_t readback = 0;
-    if (read(Reg::VMAX, readback)) {
-        if (readback != vmax) {
-            // Mismatch - try writing again
-            return write(Reg::VMAX, vmax);
-        }
-    }
 
     return true;
 }
