@@ -3,7 +3,6 @@
 #include "command_handler.hpp"
 #include "console.hpp"
 #include "logger.hpp"
-#include "motor_manager.hpp"
 
 extern "C" {
 I2C_HandleTypeDef hi2c1;
@@ -37,26 +36,16 @@ int main()
     // Initialize console (UART interface)
     console::initialize(&huart2);
     console::print_banner();
-    logsys::printf("[BOOT] Ready.\r\n");
+    logsys::printf("[BOOT] System Ready.\r\n");
+    logsys::printf("[INFO] Preparing for MPU9250, NRF24L01, DRV8256E\r\n");
 
     // ========================================================================
-    // TMC5160 DRIVER INITIALIZATION
+    // TODO: Hardware initialization will go here:
+    // - MPU9250 IMU (I2C or SPI)
+    // - NRF24L01 wireless (SPI)
+    // - DRV8256E motor drivers (PWM + GPIO)
+    // - Encoder inputs (Timer in encoder mode)
     // ========================================================================
-
-    // Enable driver power and wait for power-up
-    TMC_DriversEnable(true);
-    HAL_Delay(500); // 500ms power-up delay
-
-    // Configure SPI speed for TMC5160 communication
-    // Using prescaler 32 → 64MHz/32 = 2MHz (well below 4MHz limit for safety)
-    // and recommendation from TMC5160 datasheet
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
-    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
-        Error_Handler();
-    }
-
-    // Initialize all motor contexts
-    motor_manager::initialize();
 
     // ========================================================================
     // MAIN LOOP
@@ -73,8 +62,12 @@ int main()
             console::clear_command();
         }
 
-        // Service timed motor moves
-        motor_manager::service_timed_moves();
+        // TODO: Main control loop tasks
+        // - Read IMU data (MPU9250)
+        // - Read encoder positions
+        // - Run balancing PID controller
+        // - Update motor PWM outputs
+        // - Handle wireless communication (NRF24L01)
 
         // Blink heartbeat LED
         const uint32_t now = HAL_GetTick();
