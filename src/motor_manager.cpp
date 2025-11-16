@@ -45,17 +45,17 @@ namespace
         cfg.use_internal_rsense = false; // External sense resistors
 
         // Current settings (out of 31 max)
-        cfg.ihold = 8; // Holding current (reduced for testing)
-        cfg.irun = 16; // Running current (reduced for testing)
+        cfg.ihold = 8; // Holding current (moderate)
+        cfg.irun = 16; // Running current (50% of max)
         cfg.ihold_delay = 6; // Delay before reducing to hold current
         cfg.tpowerdown = 20; // Power down delay
 
-        // Microstepping and chopper settings
+        // Microstepping and chopper settings (using datasheet example values)
         cfg.microsteps = 256; // 256 microsteps per full step
-        cfg.toff = 5; // Chopper off time (increased from 4)
-        cfg.hend = 5; // Hysteresis end value (increased from 1)
-        cfg.hstrt = 4; // Hysteresis start value
-        cfg.blank_time = 2; // Comparator blank time
+        cfg.toff = 3; // Chopper off time (datasheet example for SpreadCycle)
+        cfg.hend = 1; // Hysteresis end value (datasheet example)
+        cfg.hstrt = 4; // Hysteresis start value (datasheet example)
+        cfg.blank_time = 2; // Comparator blank time (TBL=2)
         cfg.high_vsense = false; // Low sense resistor voltage
         cfg.enable_interpolation
             = true; // Enable step interpolation to 256 µsteps

@@ -47,20 +47,16 @@ int main()
     TMC_DriversEnable(true);
     HAL_Delay(500); // 500ms power-up delay
 
-    // Configure SPI at lower speed for initialization (safer)
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+    // Configure SPI speed for TMC5160 communication
+    // Using prescaler 32 → 64MHz/32 = 2MHz (well below 4MHz limit for safety)
+    // and recommendation from TMC5160 datasheet
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
     if (HAL_SPI_Init(&hspi1) != HAL_OK) {
         Error_Handler();
     }
 
     // Initialize all motor contexts
     motor_manager::initialize();
-
-    // After initialization, increase SPI speed for normal operation
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
-    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
-        Error_Handler();
-    }
 
     // ========================================================================
     // MAIN LOOP

@@ -195,32 +195,16 @@ inline uint32_t Motor::velocityToReg(
 
 inline bool Motor::initialize(const Config& cfg)
 {
-    // Read CHOPCONF before reset to see current state
-    uint32_t chopconf_before = 0;
-    read(Reg::CHOPCONF, chopconf_before);
-    logsys::printf("[RESET] CHOPCONF before reset: 0x%08lX (TOFF=%lu)\r\n",
-        (unsigned long)chopconf_before, 
-        (unsigned long)(chopconf_before & 0x0F));
-    
-    // Software reset: Write GCONF with RECALIBRATE bit to reset driver
-    logsys::printf("[RESET] Triggering TMC5160 reset...\r\n");
-    uint32_t reset_gconf = GCONF::RECALIBRATE.set(0, 1);
-    if (!write(Reg::GCONF, reset_gconf))
-        return false;
-    
-    // Wait for reset to complete (datasheet recommends ~200ms)
-    #ifndef UNIT_TEST
-    HAL_Delay(200);
-    #endif
-    
-    // Read CHOPCONF after reset - should be power-on default (0x10410150)
-    uint32_t chopconf_after = 0;
-    read(Reg::CHOPCONF, chopconf_after);
-    logsys::printf("[RESET] CHOPCONF after reset: 0x%08lX (TOFF=%lu) %s\r\n",
-        (unsigned long)chopconf_after,
-        (unsigned long)(chopconf_after & 0x0F),
-        (chopconf_after == 0x10410150) ? "[RESET OK]" : "[UNEXPECTED]");
-    
+    // Clear any existing GSTAT flags first
+    logsys::printf("[INIT] Clearing GSTAT flags...\r\n");
+    write(Reg::GSTAT, 0x07); // Clear all GSTAT flags (reset, drv_err, uv_cp)
+
+    // Verify GSTAT was cleared
+    uint32_t gstat_verify = 0;
+    read(Reg::GSTAT, gstat_verify);
+    logsys::printf(
+        "[INIT] GSTAT after clear: 0x%08lX\r\n", (unsigned long)gstat_verify);
+
     if (cfg.write_gconf) {
         uint32_t gconf = 0;
         if (cfg.enable_stealthchop)
@@ -241,27 +225,40 @@ inline bool Motor::initialize(const Config& cfg)
             return false;
     }
 
-    // CRITICAL: Write CHOPCONF before IHOLD_IRUN to avoid driver disable
+    // CRITICAL: Write CHOPCONF in stages - first without TOFF, then enable
     if (cfg.write_chopconf) {
-        uint32_t chopconf = 0;
-        chopconf = CHOPCONF::TOFF.set(chopconf, cfg.toff);
-        chopconf = CHOPCONF::HEND.set(chopconf, cfg.hend);
-        chopconf = CHOPCONF::HSTRT.set(chopconf, cfg.hstrt);
-        chopconf = CHOPCONF::TBL.set(chopconf, cfg.blank_time);
-        chopconf = SHORT_CONF::VSENSE.set(chopconf, cfg.high_vsense ? 1 : 0);
-        // CHM: 0=stealthChop/constantToff, 1=spreadCycle (classic chopper)
-        chopconf = CHOPCONF::CHM.set(chopconf, cfg.enable_spreadcycle ? 1 : 0);
-        chopconf = CHOPCONF::INTPOL.set(chopconf, cfg.enable_interpolation);
-        chopconf = CHOPCONF::DEDGE.set(chopconf, cfg.double_edge_step);
-        chopconf = CHOPCONF::DISS2G.set(chopconf, cfg.disable_s2g_protection);
-        chopconf
-            = set_mres(chopconf, static_cast<MicrostepRes>(cfg.microsteps));
+        // Build CHOPCONF with TOFF=0 (disabled) first
+        uint32_t chopconf_disabled = 0;
+        chopconf_disabled
+            = CHOPCONF::TOFF.set(chopconf_disabled, 0); // Keep disabled
+        chopconf_disabled = CHOPCONF::HEND.set(chopconf_disabled, cfg.hend);
+        chopconf_disabled = CHOPCONF::HSTRT.set(chopconf_disabled, cfg.hstrt);
+        chopconf_disabled
+            = CHOPCONF::TBL.set(chopconf_disabled, cfg.blank_time);
+        chopconf_disabled = SHORT_CONF::VSENSE.set(
+            chopconf_disabled, cfg.high_vsense ? 1 : 0);
+        chopconf_disabled = CHOPCONF::CHM.set(
+            chopconf_disabled, cfg.enable_spreadcycle ? 1 : 0);
+        chopconf_disabled
+            = CHOPCONF::INTPOL.set(chopconf_disabled, cfg.enable_interpolation);
+        chopconf_disabled
+            = CHOPCONF::DEDGE.set(chopconf_disabled, cfg.double_edge_step);
+        chopconf_disabled = CHOPCONF::DISS2G.set(
+            chopconf_disabled, cfg.disable_s2g_protection);
+        chopconf_disabled = set_mres(
+            chopconf_disabled, static_cast<MicrostepRes>(cfg.microsteps));
 
-        // Write CHOPCONF twice - TMC5160 sometimes needs this for TOFF to stick
-        if (!write(Reg::CHOPCONF, chopconf))
+        logsys::printf("[INIT] Writing CHOPCONF (TOFF=0): 0x%08lX\r\n",
+            (unsigned long)chopconf_disabled);
+
+        if (!write(Reg::CHOPCONF, chopconf_disabled))
             return false;
-        if (!write(Reg::CHOPCONF, chopconf))
-            return false;
+
+        // Read back to verify
+        uint32_t chopconf_check = 0;
+        read(Reg::CHOPCONF, chopconf_check);
+        logsys::printf("[INIT] CHOPCONF readback (TOFF=0): 0x%08lX\r\n",
+            (unsigned long)chopconf_check);
     }
 
     if (cfg.write_ihold_irun) {
@@ -269,8 +266,92 @@ inline bool Motor::initialize(const Config& cfg)
         ihold_irun = IHOLD_IRUN::IHOLD.set(ihold_irun, cfg.ihold);
         ihold_irun = IHOLD_IRUN::IRUN.set(ihold_irun, cfg.irun);
         ihold_irun = IHOLD_IRUN::IHOLDDELAY.set(ihold_irun, cfg.ihold_delay);
+
+        logsys::printf(
+            "[INIT] Writing IHOLD_IRUN: 0x%08lX (IHOLD=%lu IRUN=%lu)\r\n",
+            (unsigned long)ihold_irun, (unsigned long)cfg.ihold,
+            (unsigned long)cfg.irun);
+
         if (!write(Reg::IHOLD_IRUN, ihold_irun))
             return false;
+
+        // Now enable the driver by setting TOFF > 0
+        if (cfg.write_chopconf && cfg.toff > 0) {
+            uint32_t chopconf_enabled = 0;
+            chopconf_enabled = CHOPCONF::TOFF.set(chopconf_enabled, cfg.toff);
+            chopconf_enabled = CHOPCONF::HEND.set(chopconf_enabled, cfg.hend);
+            chopconf_enabled = CHOPCONF::HSTRT.set(chopconf_enabled, cfg.hstrt);
+            chopconf_enabled
+                = CHOPCONF::TBL.set(chopconf_enabled, cfg.blank_time);
+            chopconf_enabled = SHORT_CONF::VSENSE.set(
+                chopconf_enabled, cfg.high_vsense ? 1 : 0);
+            chopconf_enabled = CHOPCONF::CHM.set(
+                chopconf_enabled, cfg.enable_spreadcycle ? 1 : 0);
+            chopconf_enabled = CHOPCONF::INTPOL.set(
+                chopconf_enabled, cfg.enable_interpolation);
+            chopconf_enabled
+                = CHOPCONF::DEDGE.set(chopconf_enabled, cfg.double_edge_step);
+            chopconf_enabled = CHOPCONF::DISS2G.set(
+                chopconf_enabled, cfg.disable_s2g_protection);
+            chopconf_enabled = set_mres(
+                chopconf_enabled, static_cast<MicrostepRes>(cfg.microsteps));
+
+            logsys::printf("[INIT] Enabling driver (TOFF=%lu): 0x%08lX\r\n",
+                (unsigned long)cfg.toff, (unsigned long)chopconf_enabled);
+
+            if (!write(Reg::CHOPCONF, chopconf_enabled))
+                return false;
+        }
+
+        // Debug: Read GSTAT (global status) to check for UV/charge pump/reset
+        uint32_t gstat = 0;
+        if (read(Reg::GSTAT, gstat)) {
+            uint32_t reset = gstat & 0x1;
+            uint32_t drv_err = (gstat >> 1) & 0x1;
+            uint32_t uv_cp = (gstat >> 2) & 0x1;
+            logsys::printf(
+                "[GSTAT] 0x%08lX reset=%lu drv_err=%lu uv_cp=%lu\r\n",
+                (unsigned long)gstat, (unsigned long)reset,
+                (unsigned long)drv_err, (unsigned long)uv_cp);
+            if (uv_cp) {
+                logsys::printf(
+                    "[FAULT] Charge pump undervoltage detected!\r\n");
+            }
+        }
+
+        // Debug: Read DRV_STATUS immediately after setting current
+        uint32_t drv_status = 0;
+        if (read(Reg::DRV_STATUS, drv_status)) {
+            uint32_t otpw
+                = (drv_status >> 26) & 0x1; // Overtemperature pre-warning
+            uint32_t ot = (drv_status >> 25) & 0x1; // Overtemperature
+            uint32_t s2ga = (drv_status >> 27) & 0x1; // Short to GND phase A
+            uint32_t s2gb = (drv_status >> 28) & 0x1; // Short to GND phase B
+            uint32_t s2vsa
+                = (drv_status >> 29) & 0x1; // Short to supply phase A
+            uint32_t s2vsb
+                = (drv_status >> 30) & 0x1; // Short to supply phase B
+            uint32_t ola = (drv_status >> 18) & 0x1; // Open load phase A
+            uint32_t olb = (drv_status >> 19) & 0x1; // Open load phase B
+            uint32_t stst = (drv_status >> 31) & 0x1; // Standstill detected
+
+            logsys::printf("[DRV_STATUS] After IHOLD_IRUN: 0x%08lX\r\n",
+                (unsigned long)drv_status);
+            logsys::printf("[DRV_FAULTS] ot=%lu otpw=%lu s2ga=%lu s2gb=%lu "
+                           "s2vsa=%lu s2vsb=%lu ola=%lu olb=%lu stst=%lu\r\n",
+                (unsigned long)ot, (unsigned long)otpw, (unsigned long)s2ga,
+                (unsigned long)s2gb, (unsigned long)s2vsa, (unsigned long)s2vsb,
+                (unsigned long)ola, (unsigned long)olb, (unsigned long)stst);
+        }
+
+        // Read CHOPCONF again to see if TOFF was cleared
+        uint32_t chopconf_final = 0;
+        if (read(Reg::CHOPCONF, chopconf_final)) {
+            uint32_t toff_final = chopconf_final & 0x0F;
+            logsys::printf("[INIT] Final CHOPCONF: 0x%08lX TOFF=%lu %s\r\n",
+                (unsigned long)chopconf_final, (unsigned long)toff_final,
+                (toff_final == 0) ? "[DISABLED BY PROTECTION!]" : "[OK]");
+        }
     }
 
     if (cfg.write_tpowerdown) {
