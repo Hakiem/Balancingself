@@ -1,7 +1,10 @@
+
 #include "main.h"
+#include "MPU9250_regs.hpp"
 #include "board.hpp"
 #include "command_handler.hpp"
 #include "console.hpp"
+#include "i2c_bridge.hpp"
 #include "logger.hpp"
 
 extern "C" {
@@ -27,6 +30,7 @@ int main()
     // Initialize peripherals
     MX_GPIO_Init();
     MX_SPI1_Init();
+    MX_I2C1_Init();
     MX_USART2_UART_Init();
     BlinkyLED();
 
@@ -40,12 +44,17 @@ int main()
     logsys::printf("[INFO] Preparing for MPU9250, NRF24L01, DRV8256E\r\n");
 
     // ========================================================================
-    // TODO: Hardware initialization will go here:
-    // - MPU9250 IMU (I2C or SPI)
-    // - NRF24L01 wireless (SPI)
-    // - DRV8256E motor drivers (PWM + GPIO)
-    // - Encoder inputs (Timer in encoder mode)
+    // MPU9250 WHO_AM_I register read test
     // ========================================================================
+    I2CBridge i2c(&hi2c1);
+    uint8_t whoami = 0;
+    bool ok = i2c.readRegister(
+        MPU9250::I2C_ADDR_AD0_LOW, MPU9250::WHO_AM_I, whoami);
+    if (ok) {
+        logsys::printf("[MPU9250] WHO_AM_I = 0x%02X\r\n", whoami);
+    } else {
+        logsys::printf("[MPU9250] WHO_AM_I read failed!\r\n");
+    }
 
     // ========================================================================
     // MAIN LOOP
