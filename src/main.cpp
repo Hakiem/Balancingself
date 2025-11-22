@@ -1,11 +1,12 @@
-
 #include "main.h"
+#include "mpu9250.hpp"
 #include "MPU9250_regs.hpp"
 #include "board.hpp"
 #include "command_handler.hpp"
 #include "console.hpp"
 #include "i2c_bridge.hpp"
 #include "logger.hpp"
+#include <cmath>
 
 extern "C" {
 I2C_HandleTypeDef hi2c1;
@@ -18,6 +19,57 @@ namespace
 {
 constexpr uint32_t kBlinkIntervalMs = 1000; // LED blink interval
 } // namespace
+
+// Add these global variables or in a struct/class as needed
+float accel_bias[3] = { 0 }, gyro_bias[3] = { 0 }, mag_bias[3] = { 0 };
+
+// Helper function to compute average bias
+void calibrate_bias(MPU9250& imu, int samples = 50)
+{
+    float accel_sum[3] = { 0 }, gyro_sum[3] = { 0 }, mag_sum[3] = { 0 };
+    for (int i = 0; i < samples; ++i) {
+        float a[3], g[3], m[3];
+        imu.readAccel(a);
+        imu.readGyro(g);
+        imu.readMag(m);
+        for (int j = 0; j < 3; ++j) {
+            accel_sum[j] += a[j];
+            gyro_sum[j] += g[j];
+            mag_sum[j] += m[j];
+        }
+        HAL_Delay(10);
+    }
+    for (int j = 0; j < 3; ++j) {
+        accel_bias[j] = accel_sum[j] / samples;
+        gyro_bias[j] = gyro_sum[j] / samples;
+        mag_bias[j] = mag_sum[j] / samples;
+    }
+}
+
+// Helper function to compute pitch, roll, yaw
+void compute_orientation(float* accel, float* gyro, float* mag, float& pitch,
+    float& roll, float& yaw)
+{
+    // Remove bias
+    for (int i = 0; i < 3; ++i) {
+        accel[i] -= accel_bias[i];
+        gyro[i] -= gyro_bias[i];
+        mag[i] -= mag_bias[i];
+    }
+    // Calculate roll and pitch from accelerometer
+    roll = atan2(accel[1], accel[2]) * 180.0f / M_PI;
+    pitch = atan(-accel[0] / sqrt(accel[1] * accel[1] + accel[2] * accel[2]))
+        * 180.0f / M_PI;
+    // Yaw from magnetometer (compensate for tilt)
+    float mag_x
+        = mag[0] * cos(pitch * M_PI / 180) + mag[2] * sin(pitch * M_PI / 180);
+    float mag_y = mag[0] * sin(roll * M_PI / 180) * sin(pitch * M_PI / 180)
+        + mag[1] * cos(roll * M_PI / 180)
+        - mag[2] * sin(roll * M_PI / 180) * cos(pitch * M_PI / 180);
+    yaw = atan2(-mag_y, mag_x) * 180.0f / M_PI;
+    if (yaw < 0)
+        yaw += 360.0f;
+}
 
 int main()
 {
@@ -56,6 +108,12 @@ int main()
         logsys::printf("[MPU9250] WHO_AM_I read failed!\r\n");
     }
 
+    // Initialize MPU9250 object
+    MPU9250 imu(&hi2c1);
+
+    // Calibrate bias at startup
+    calibrate_bias(imu, 50);
+
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
@@ -71,12 +129,18 @@ int main()
             console::clear_command();
         }
 
-        // TODO: Main control loop tasks
-        // - Read IMU data (MPU9250)
-        // - Read encoder positions
-        // - Run balancing PID controller
-        // - Update motor PWM outputs
-        // - Handle wireless communication (NRF24L01)
+        // Read sensors
+        float accel[3], gyro[3], mag[3];
+        imu.readAccel(accel);
+        imu.readGyro(gyro);
+        imu.readMag(mag);
+
+        // Compute orientation
+        float pitch, roll, yaw;
+        compute_orientation(accel, gyro, mag, pitch, roll, yaw);
+
+        // Now you can use pitch, roll, yaw
+        // logsys::printf("P:%.2f R:%.2f Y:%.2f\r\n", pitch, roll, yaw);
 
         // Blink heartbeat LED
         const uint32_t now = HAL_GetTick();
