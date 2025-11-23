@@ -663,11 +663,6 @@ inline void MPU9250Driver::updateOrientation(
     const float pitch_rad = atan2f(-ax, sqrtf(ay * ay + az * az));
 
     float yaw_deg = euler_.yaw;
-    // Integrate gyro Z if no magnetometer heading
-    if (!mag && dt_ms > 0.0f) {
-        yaw_deg += gyro.z * (dt_ms / 1000.0f);
-    }
-
     if (mag) {
         const float cr = cosf(roll_rad);
         const float sr = sinf(roll_rad);
@@ -682,6 +677,9 @@ inline void MPU9250Driver::updateOrientation(
         const float Yh = mx * sr * sp + my * cr - mz * sr * cp;
 
         yaw_deg = atan2f(-Yh, Xh) * 180.0f / M_PI;
+    } else if (dt_ms > 0.0f) {
+        // No mag update available; integrate gyro Z to maintain heading
+        yaw_deg += gyro.z * (dt_ms / 1000.0f);
     }
 
     while (yaw_deg < 0.0f) {
@@ -759,15 +757,6 @@ inline bool MPU9250Driver::readAccel(Vector3& accel)
 inline bool MPU9250Driver::readMag(Vector3& mag)
 {
     if (!mag_enabled_) {
-        return false;
-    }
-
-    uint8_t status;
-    if (!readMagRegister(MPU9250::AK8963::ST1, status)) {
-        return false;
-    }
-
-    if ((status & MPU9250::AK8963_BITS::DRDY) == 0) {
         return false;
     }
 
