@@ -1,6 +1,6 @@
 #include "main.h"
-#include "mpu9250.hpp"
 #include "MPU9250_regs.hpp"
+#include "mpu9250.hpp"
 #include "board.hpp"
 #include "command_handler.hpp"
 #include "console.hpp"
@@ -20,56 +20,7 @@ namespace
 constexpr uint32_t kBlinkIntervalMs = 1000; // LED blink interval
 } // namespace
 
-// Add these global variables or in a struct/class as needed
-float accel_bias[3] = { 0 }, gyro_bias[3] = { 0 }, mag_bias[3] = { 0 };
-
-// Helper function to compute average bias
-void calibrate_bias(MPU9250& imu, int samples = 50)
-{
-    float accel_sum[3] = { 0 }, gyro_sum[3] = { 0 }, mag_sum[3] = { 0 };
-    for (int i = 0; i < samples; ++i) {
-        float a[3], g[3], m[3];
-        imu.readAccel(a);
-        imu.readGyro(g);
-        imu.readMag(m);
-        for (int j = 0; j < 3; ++j) {
-            accel_sum[j] += a[j];
-            gyro_sum[j] += g[j];
-            mag_sum[j] += m[j];
-        }
-        HAL_Delay(10);
-    }
-    for (int j = 0; j < 3; ++j) {
-        accel_bias[j] = accel_sum[j] / samples;
-        gyro_bias[j] = gyro_sum[j] / samples;
-        mag_bias[j] = mag_sum[j] / samples;
-    }
-}
-
-// Helper function to compute pitch, roll, yaw
-void compute_orientation(float* accel, float* gyro, float* mag, float& pitch,
-    float& roll, float& yaw)
-{
-    // Remove bias
-    for (int i = 0; i < 3; ++i) {
-        accel[i] -= accel_bias[i];
-        gyro[i] -= gyro_bias[i];
-        mag[i] -= mag_bias[i];
-    }
-    // Calculate roll and pitch from accelerometer
-    roll = atan2(accel[1], accel[2]) * 180.0f / M_PI;
-    pitch = atan(-accel[0] / sqrt(accel[1] * accel[1] + accel[2] * accel[2]))
-        * 180.0f / M_PI;
-    // Yaw from magnetometer (compensate for tilt)
-    float mag_x
-        = mag[0] * cos(pitch * M_PI / 180) + mag[2] * sin(pitch * M_PI / 180);
-    float mag_y = mag[0] * sin(roll * M_PI / 180) * sin(pitch * M_PI / 180)
-        + mag[1] * cos(roll * M_PI / 180)
-        - mag[2] * sin(roll * M_PI / 180) * cos(pitch * M_PI / 180);
-    yaw = atan2(-mag_y, mag_x) * 180.0f / M_PI;
-    if (yaw < 0)
-        yaw += 360.0f;
-}
+volatile bool g_imu_int_flag = false;
 
 int main()
 {
@@ -99,20 +50,30 @@ int main()
     // MPU9250 WHO_AM_I register read test
     // ========================================================================
     I2CBridge i2c(&hi2c1);
+
+    MPU9250Driver imu(&i2c);
+
+    bool ready_low = i2c.isDeviceReady(MPU9250::I2C_ADDR_AD0_LOW);
+    logsys::printf("[MPU9250] Addr 0x68 ready: %s (HAL=%d)\r\n",
+        ready_low ? "YES" : "NO", i2c.lastStatus());
+    bool ready_high = i2c.isDeviceReady(MPU9250::I2C_ADDR_AD0_HIGH);
+    logsys::printf("[MPU9250] Addr 0x69 ready: %s (HAL=%d)\r\n",
+        ready_high ? "YES" : "NO", i2c.lastStatus());
+
     uint8_t whoami = 0;
     bool ok = i2c.readRegister(
         MPU9250::I2C_ADDR_AD0_LOW, MPU9250::WHO_AM_I, whoami);
-    if (ok) {
-        logsys::printf("[MPU9250] WHO_AM_I = 0x%02X\r\n", whoami);
-    } else {
-        logsys::printf("[MPU9250] WHO_AM_I read failed!\r\n");
-    }
+    logsys::printf("[MPU9250] WHO_AM_I @0x68 %s (0x%02X, HAL=%d)\r\n",
+        ok ? "OK" : "FAIL", whoami, i2c.lastStatus());
 
-    // Initialize MPU9250 object
-    MPU9250 imu(&hi2c1);
-
-    // Calibrate bias at startup
-    calibrate_bias(imu, 50);
+    imu.initialize();
+    imu.initializeMagnetometer();
+    logsys::printf("[MPU9250] Calibrating gyro (keep still)...\r\n");
+    imu.calibrateGyro(500);
+    logsys::printf("[MPU9250] Gyro calibration done\r\n");
+    logsys::printf("[MPU9250] Calibrating magnetometer (move in figure 8)...\r\n");
+    imu.calibrateMag(300, 20);
+    logsys::printf("[MPU9250] Magnetometer calibration done\r\n");
 
     // ========================================================================
     // MAIN LOOP
@@ -129,18 +90,14 @@ int main()
             console::clear_command();
         }
 
-        // Read sensors
-        float accel[3], gyro[3], mag[3];
-        imu.readAccel(accel);
-        imu.readGyro(gyro);
-        imu.readMag(mag);
-
-        // Compute orientation
-        float pitch, roll, yaw;
-        compute_orientation(accel, gyro, mag, pitch, roll, yaw);
-
-        // Now you can use pitch, roll, yaw
-        // logsys::printf("P:%.2f R:%.2f Y:%.2f\r\n", pitch, roll, yaw);
+        if (g_imu_int_flag) {
+            g_imu_int_flag = false;
+            if (imu.dataReady() && imu.update()) {
+                const auto& e = imu.getEulerAngles();
+                logsys::printf("[IMU] roll=%.2f pitch=%.2f yaw=%.2f\r\n",
+                            e.roll, e.pitch, e.yaw);
+            }
+        }
 
         // Blink heartbeat LED
         const uint32_t now = HAL_GetTick();

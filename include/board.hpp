@@ -170,20 +170,22 @@ inline void MX_GPIO_Init(void)
 
     GPIO_InitTypeDef GPIO_InitStruct = { 0 };
 
-    /* Configure GPIO pins : PA0 PA1 as chip-selects (active low) */
-    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_11;
+    /* Configure GPIO pins : PA1 PA11 as chip-selects (active low) */
+    GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_11;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_11, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1 | GPIO_PIN_11, GPIO_PIN_SET);
 
-    GPIO_InitStruct.Pin = GPIO_PIN_11;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    /* Configure GPIO pin : PA0 as MPU9250 INT (active-low pulse) */
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET);
+
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
     /* Configure GPIO pin : PC13 (status LED) */
     GPIO_InitStruct.Pin = GPIO_PIN_13;

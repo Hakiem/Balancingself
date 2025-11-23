@@ -1,26 +1,20 @@
 /**
  * @file mpu9250.hpp
- * @brief MPU9250 9-axis IMU driver with DMP support (Header-only)
+ * @brief MPU9250 9-axis IMU driver (header-only)
  *
- * High-level driver for MPU9250 that uses the Digital Motion Processor (DMP)
- * to perform sensor fusion on-chip, providing quaternion output that can be
- * converted to roll, pitch, and yaw angles.
+ * High-level driver for MPU9250 that reads raw gyro/accel/mag data and
+ * computes basic roll, pitch, and yaw angles in firmware (no on-chip fusion).
  *
  * Key features:
- * - DMP-based sensor fusion (quaternion output)
- * - Automatic gyro calibration
- * - Roll, pitch, yaw angle calculation
- * - Temperature reading
- * - Magnetometer support (AK8963)
+ * - Raw sensor access (gyro, accel, mag, temperature)
+ * - Simple roll/pitch/yaw calculation (tilt + mag heading)
  * - Configurable sample rates and ranges
- * - FIFO management
- * - Interrupt support
+ * - FIFO and interrupt support
  */
 
 #pragma once
 
 #include "MPU9250_regs.hpp"
-#include "dmp_firmware.hpp"
 #include "i2c_bridge.hpp"
 #include "logger.hpp"
 #include <cmath>
@@ -34,12 +28,11 @@
 
 /**
  * @class MPU9250
- * @brief Complete MPU9250 driver with DMP support
+ * @brief Complete MPU9250 driver
  *
  * Usage example:
  *   MPU9250 imu(&i2c_bridge, MPU9250::I2C_ADDR_AD0_LOW);
  *   imu.initialize();
- *   imu.initializeDMP();
  *
  *   // In main loop:
  *   if (imu.dataReady()) {
@@ -132,16 +125,22 @@ public:
         uint16_t sample_rate_hz;
         bool enable_magnetometer;
         bool enable_interrupts;
-        uint16_t dmp_features;
+        bool int_active_low;
+        bool int_open_drain;
+        bool int_latch;
+        bool int_clear_on_read;
 
         Config()
             : gyro_fsr(MPU9250::GYRO_CONFIG_BITS::FS_SEL::DPS_2000)
             , accel_fsr(MPU9250::ACCEL_CONFIG_BITS::AFS_SEL::G_2)
             , dlpf(MPU9250::CONFIG_BITS::DLPF::BW_20HZ)
-            , sample_rate_hz(MPU9250::DMP::BALANCE_SAMPLE_RATE)
+            , sample_rate_hz(200) // default 200 Hz
             , enable_magnetometer(false)
             , enable_interrupts(true)
-            , dmp_features(MPU9250::DMP::FEATURES_BALANCE)
+            , int_active_low(true)
+            , int_open_drain(false)
+            , int_latch(true)
+            , int_clear_on_read(true)
         {
         }
     };
@@ -156,11 +155,13 @@ public:
         I2CBridge* i2c, uint8_t address = MPU9250::I2C_ADDR_AD0_LOW)
         : i2c_(i2c)
         , address_(address)
-        , dmp_enabled_(false)
         , mag_enabled_(false)
         , gyro_scale_(MPU9250::SENSITIVITY::GYRO_2000DPS)
         , accel_scale_(MPU9250::SENSITIVITY::ACCEL_2G)
+        , last_update_ms_(0)
     {
+        mag_user_offset_ = Vector3(0.0f, 0.0f, 0.0f);
+        mag_user_scale_ = Vector3(1.0f, 1.0f, 1.0f);
     }
 
     // ========================================================================
@@ -175,23 +176,6 @@ public:
     bool initialize(const Config& config = Config());
 
     /**
-     * @brief Initialize DMP (Digital Motion Processor)
-     * @return true if successful
-     */
-    bool initializeDMP();
-
-    /**
-     * @brief Complete initialization with DMP and calibration
-     * Performs: basic init, DMP init, gyro calibration, interrupt setup
-     * @param config Configuration structure (optional)
-     * @param calibration_samples Number of samples for gyro calibration
-     * (default: 200)
-     * @return true if successful
-     */
-    bool initializeWithDMP(
-        const Config& config = Config(), uint16_t calibration_samples = 200);
-
-    /**
      * @brief Reset device to default state
      * @return true if successful
      */
@@ -204,41 +188,6 @@ public:
     bool testConnection();
 
     // ========================================================================
-    // DMP Control
-    // ========================================================================
-
-    /**
-     * @brief Enable DMP
-     * @return true if successful
-     */
-    bool enableDMP();
-
-    /**
-     * @brief Disable DMP
-     * @return true if successful
-     */
-    bool disableDMP();
-
-    /**
-     * @brief Check if DMP is enabled
-     */
-    bool isDMPEnabled() const { return dmp_enabled_; }
-
-    /**
-     * @brief Set DMP features
-     * @param features Feature flags (see MPU9250::DMP::FEATURE_*)
-     * @return true if successful
-     */
-    bool setDMPFeatures(uint16_t features);
-
-    /**
-     * @brief Set DMP sample rate
-     * @param rate_hz Sample rate in Hz (4-200)
-     * @return true if successful
-     */
-    bool setDMPSampleRate(uint16_t rate_hz);
-
-    // ========================================================================
     // Data Acquisition
     // ========================================================================
 
@@ -249,7 +198,7 @@ public:
     bool dataReady();
 
     /**
-     * @brief Update all sensor data from DMP FIFO
+     * @brief Update sensor data from gyro/accel/mag
      * @return true if successful
      */
     bool update();
@@ -461,6 +410,15 @@ public:
     bool calibrateAccel(uint16_t samples = 1000);
 
     /**
+     * @brief Calibrate magnetometer (hard/soft iron)
+     * Collects samples while you move the board in figure-8s.
+     * @param samples Number of samples to collect
+     * @param delay_ms Delay between samples
+     * @return true if successful
+     */
+    bool calibrateMag(uint16_t samples = 300, uint16_t delay_ms = 20);
+
+    /**
      * @brief Load gyro bias offsets
      * @param offset_x X axis offset
      * @param offset_y Y axis offset
@@ -488,8 +446,7 @@ private:
     I2CBridge* i2c_;
     uint8_t address_;
 
-    // DMP state
-    bool dmp_enabled_;
+    // State
     bool mag_enabled_;
 
     // Sensor data
@@ -499,6 +456,8 @@ private:
     Vector3 accel_;
     Vector3 mag_;
     float temperature_;
+    Vector3 mag_user_offset_;
+    Vector3 mag_user_scale_;
 
     // Scale factors
     float gyro_scale_;
@@ -510,200 +469,12 @@ private:
     // Error tracking
     const char* last_error_;
 
-    // DMP firmware (will be loaded from external array)
-    const uint8_t* dmp_firmware_;
-    uint16_t dmp_firmware_size_;
+    uint32_t last_update_ms_;
 
-    // Helper functions
-    bool writeDMPMemory(uint16_t mem_addr, const uint8_t* data, uint16_t length)
-    {
-        uint8_t bank = (mem_addr >> 8) & 0xFF;
-        uint8_t offset = mem_addr & 0xFF;
-
-        if (!setMemoryBank(bank)) {
-            return false;
-        }
-
-        if (!setMemoryStartAddress(offset)) {
-            return false;
-        }
-
-        return i2c_->writeRegisters(address_, MPU9250::MEM_R_W, data, length);
-    }
-
-    bool readDMPMemory(uint16_t mem_addr, uint8_t* data, uint16_t length)
-    {
-        uint8_t bank = (mem_addr >> 8) & 0xFF;
-        uint8_t offset = mem_addr & 0xFF;
-
-        if (!setMemoryBank(bank)) {
-            return false;
-        }
-
-        if (!setMemoryStartAddress(offset)) {
-            return false;
-        }
-
-        return i2c_->readRegisters(address_, MPU9250::MEM_R_W, data, length);
-    }
-
-    bool setMemoryBank(uint8_t bank)
-    {
-        return i2c_->writeRegister(address_, MPU9250::BANK_SEL, bank);
-    }
-
-    bool setMemoryStartAddress(uint8_t addr)
-    {
-        return i2c_->writeRegister(address_, MPU9250::MEM_START_ADDR, addr);
-    }
-
-    bool setDMPStartAddress(uint16_t start_addr)
-    {
-        uint8_t data[2] = { static_cast<uint8_t>((start_addr >> 8) & 0xFF),
-            static_cast<uint8_t>(start_addr & 0xFF) };
-        return i2c_->writeRegisters(
-            address_, MPU9250::DMP_CFG_1, data, sizeof(data));
-    }
-
-    bool loadDMPFirmware(const uint8_t* firmware, uint16_t size)
-    {
-        // Load firmware in chunks to avoid I2C timeout
-        constexpr uint16_t CHUNK_SIZE = 16; // Write 16 bytes at a time
-        uint16_t bytes_written = 0;
-
-        logsys::printf(
-            "[MPU9250] Loading firmware in %d-byte chunks...\r\n", CHUNK_SIZE);
-
-        while (bytes_written < size) {
-            uint16_t chunk_size = (size - bytes_written > CHUNK_SIZE)
-                ? CHUNK_SIZE
-                : (size - bytes_written);
-
-            if (!writeDMPMemory(
-                    bytes_written, &firmware[bytes_written], chunk_size)) {
-                logsys::printf(
-                    "[MPU9250] Firmware write failed at offset %d\r\n",
-                    bytes_written);
-                return false;
-            }
-
-            bytes_written += chunk_size;
-
-            // Print progress every 256 bytes
-            if (bytes_written % 256 == 0 || bytes_written == size) {
-                logsys::printf("[MPU9250] Progress: %d/%d bytes (%.1f%%)\r\n",
-                    bytes_written, size, (bytes_written * 100.0f) / size);
-            }
-        }
-
-        // Verify firmware by reading back first few bytes
-        uint8_t verify[16];
-        if (readDMPMemory(0, verify, 16)) {
-            bool match = true;
-            for (int i = 0; i < 16; i++) {
-                if (verify[i] != firmware[i]) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match) {
-                logsys::printf("[MPU9250] Firmware verification passed\r\n");
-            } else {
-                logsys::printf(
-                    "[MPU9250] WARNING: Firmware verification failed\r\n");
-                return false;
-            }
-        }
-
-        if (!setDMPStartAddress(MPU9250::DMP::START_ADDRESS)) {
-            logsys::printf(
-                "[MPU9250] ERROR: Failed to set DMP start address\r\n");
-            return false;
-        }
-        logsys::printf("[MPU9250] DMP start address set to 0x%04X\r\n",
-            MPU9250::DMP::START_ADDRESS);
-
-        return true;
-    }
-
-    void quaternionToEuler(const Quaternion& q, EulerAngles& e)
-    {
-        // Roll (x-axis rotation)
-        float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
-        float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
-        e.roll = atan2f(sinr_cosp, cosr_cosp) * 180.0f / M_PI;
-
-        // Pitch (y-axis rotation)
-        float sinp = 2.0f * (q.w * q.y - q.z * q.x);
-        if (fabsf(sinp) >= 1.0f) {
-            e.pitch = copysignf(90.0f, sinp); // Use ±90° if out of range
-        } else {
-            e.pitch = asinf(sinp) * 180.0f / M_PI;
-        }
-
-        // Yaw (z-axis rotation)
-        float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
-        float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
-        e.yaw = atan2f(siny_cosp, cosy_cosp) * 180.0f / M_PI;
-
-        // Normalize yaw to 0-360
-        if (e.yaw < 0.0f) {
-            e.yaw += 360.0f;
-        }
-    }
-
-    bool processDMPPacket(const uint8_t* packet, uint16_t length)
-    {
-        // Parse DMP packet format
-        if (length < MPU9250::DMP::BALANCE_PACKET_SIZE) {
-            return false;
-        }
-
-        // Skip header (2 bytes)
-        const uint8_t* data = packet + 2;
-
-        // Extract 6-axis quaternion (Q30 format)
-        int32_t quat_w = (static_cast<int32_t>(data[0]) << 24)
-            | (static_cast<int32_t>(data[1]) << 16)
-            | (static_cast<int32_t>(data[2]) << 8) | data[3];
-        int32_t quat_x = (static_cast<int32_t>(data[4]) << 24)
-            | (static_cast<int32_t>(data[5]) << 16)
-            | (static_cast<int32_t>(data[6]) << 8) | data[7];
-        int32_t quat_y = (static_cast<int32_t>(data[8]) << 24)
-            | (static_cast<int32_t>(data[9]) << 16)
-            | (static_cast<int32_t>(data[10]) << 8) | data[11];
-
-        // Convert to float
-        quat_.w = MPU9250::DMP::quatToFloat(quat_w);
-        quat_.x = MPU9250::DMP::quatToFloat(quat_x);
-        quat_.y = MPU9250::DMP::quatToFloat(quat_y);
-
-        // Calculate z component
-        float sum_sq
-            = quat_.w * quat_.w + quat_.x * quat_.x + quat_.y * quat_.y;
-        if (sum_sq < 1.0f) {
-            quat_.z = sqrtf(1.0f - sum_sq);
-        } else {
-            quat_.z = 0.0f;
-            quat_.normalize();
-        }
-
-        // Extract gyro data (offset 12, 6 bytes)
-        const uint8_t* gyro_data = data + 12;
-        int16_t raw_gx
-            = (static_cast<int16_t>(gyro_data[0]) << 8) | gyro_data[1];
-        int16_t raw_gy
-            = (static_cast<int16_t>(gyro_data[2]) << 8) | gyro_data[3];
-        int16_t raw_gz
-            = (static_cast<int16_t>(gyro_data[4]) << 8) | gyro_data[5];
-
-        gyro_.x = static_cast<float>(raw_gx) / gyro_scale_;
-        gyro_.y = static_cast<float>(raw_gy) / gyro_scale_;
-        gyro_.z = static_cast<float>(raw_gz) / gyro_scale_;
-
-        return true;
-    }
+    void updateOrientation(
+        const Vector3& gyro, const Vector3& accel, const Vector3* mag,
+        float dt_ms);
+    void eulerToQuaternion();
 
     // Magnetometer helpers
     bool writeMagRegister(uint8_t reg, uint8_t value)
@@ -775,10 +546,28 @@ inline bool MPU9250Driver::initialize(const Config& config)
     }
 
     if (config.enable_interrupts) {
-        if (!configureInterruptPin()) {
+        if (!configureInterruptPin(config.int_active_low,
+                config.int_open_drain, config.int_latch,
+                config.int_clear_on_read)) {
             last_error_ = "Interrupt config failed";
             return false;
         }
+
+        uint8_t int_status = 0;
+        i2c_->readRegister(address_, MPU9250::INT_STATUS, int_status);
+
+        if (!enableInterrupt()) {
+            last_error_ = "Interrupt enable failed";
+            return false;
+        }
+
+        uint8_t int_cfg = 0;
+        uint8_t int_en = 0;
+        i2c_->readRegister(address_, MPU9250::INT_PIN_CFG, int_cfg);
+        i2c_->readRegister(address_, MPU9250::INT_ENABLE, int_en);
+        logsys::printf(
+            "[MPU9250] INT cfg=0x%02X en=0x%02X status=0x%02X\r\n", int_cfg,
+            int_en, int_status);
     }
 
     if (config.enable_magnetometer) {
@@ -789,122 +578,6 @@ inline bool MPU9250Driver::initialize(const Config& config)
     }
 
     logsys::printf("[MPU9250] Basic initialization complete\r\n");
-    return true;
-}
-
-inline bool MPU9250Driver::initializeDMP()
-{
-    logsys::printf("[MPU9250] Initializing DMP...\r\n");
-
-    // Reset FIFO and DMP
-    i2c_->writeRegister(address_, MPU9250::USER_CTRL,
-        MPU9250::USER_CTRL_BITS::FIFO_RST
-            | MPU9250::USER_CTRL_BITS::SIG_COND_RST);
-    HAL_Delay(10);
-
-    logsys::printf(
-        "[MPU9250] Loading DMP firmware (%d bytes)...\r\n", DMP::FIRMWARE_SIZE);
-
-    // Load DMP firmware into MPU9250 memory banks
-    if (!loadDMPFirmware(DMP::FIRMWARE, DMP::FIRMWARE_SIZE)) {
-        last_error_ = "DMP firmware load failed";
-        logsys::printf("[MPU9250] ERROR: Firmware loading failed!\r\n");
-        return false;
-    }
-    logsys::printf("[MPU9250] Firmware loaded successfully\r\n");
-
-    // Configure INT pin: active-low, push-pull, pulse on data ready
-    logsys::printf(
-        "[MPU9250] Configuring INT pin (active-low, latched)...\r\n");
-    // Configure INT pin as active-low, push-pull, latched until read and
-    // cleared on any register read. This helps avoid missed short pulses.
-    if (!configureInterruptPin(true, false, true, true)) {
-        last_error_ = "INT pin config failed";
-        return false;
-    }
-
-    // Set DMP features BEFORE enabling DMP
-    if (!setDMPFeatures(MPU9250::DMP::FEATURES_BALANCE)) {
-        last_error_ = "DMP features config failed";
-        return false;
-    }
-
-    // Set DMP sample rate BEFORE enabling DMP
-    if (!setDMPSampleRate(MPU9250::DMP::BALANCE_SAMPLE_RATE)) {
-        last_error_ = "DMP sample rate config failed";
-        return false;
-    }
-
-    // Clear FIFO_EN register (0x23) - required for DMP mode
-    // In DMP mode, the DMP controls what goes into FIFO, not this register
-    if (!i2c_->writeRegister(address_, MPU9250::FIFO_EN, 0x00)) {
-        last_error_ = "FIFO_EN clear failed";
-        return false;
-    }
-
-    // Enable DMP and FIFO together
-    logsys::printf("[MPU9250] Enabling DMP and FIFO...\r\n");
-    uint8_t user_ctrl
-        = MPU9250::USER_CTRL_BITS::DMP_EN | MPU9250::USER_CTRL_BITS::FIFO_EN;
-    if (!i2c_->writeRegister(address_, MPU9250::USER_CTRL, user_ctrl)) {
-        last_error_ = "DMP/FIFO enable failed";
-        return false;
-    }
-
-    // Enable DMP interrupt (data ready from DMP/FIFO)
-    logsys::printf("[MPU9250] Enabling DMP interrupt...\r\n");
-    if (!enableInterrupt()) {
-        last_error_ = "Interrupt enable failed";
-        return false;
-    }
-
-    // Reset FIFO AFTER enabling everything (critical for DMP to start writing)
-    logsys::printf("[MPU9250] Resetting FIFO to start DMP operation...\r\n");
-    if (!resetFIFO()) {
-        last_error_ = "FIFO reset failed";
-        return false;
-    }
-    HAL_Delay(50); // Give DMP time to start populating FIFO
-
-    dmp_enabled_ = true;
-    logsys::printf("[MPU9250] DMP initialized successfully\r\n");
-    return true;
-}
-
-inline bool MPU9250Driver::initializeWithDMP(
-    const Config& config, uint16_t calibration_samples)
-{
-    logsys::printf(
-        "[MPU9250] Starting complete initialization with DMP...\r\n");
-
-    // Step 1: Basic initialization
-    if (!initialize(config)) {
-        logsys::printf("[MPU9250] ERROR: Basic initialization failed!\r\n");
-        return false;
-    }
-    logsys::printf("[MPU9250] Basic init OK\r\n");
-
-    // Step 2: DMP initialization
-    if (!initializeDMP()) {
-        logsys::printf("[MPU9250] ERROR: DMP initialization failed!\r\n");
-        logsys::printf(
-            "[MPU9250] Note: DMP firmware loading not yet implemented\r\n");
-        return false;
-    }
-    logsys::printf("[MPU9250] DMP enabled - sensor fusion active\r\n");
-
-    // Step 3: Gyro calibration (sensor must be stationary)
-    logsys::printf("[MPU9250] Calibrating gyro (keep sensor still)...\r\n");
-    if (!calibrateGyro(calibration_samples)) {
-        logsys::printf("[MPU9250] WARNING: Gyro calibration failed\r\n");
-    } else {
-        logsys::printf("[MPU9250] Gyro calibration complete\r\n");
-    }
-
-    logsys::printf(
-        "[MPU9250] Initialization complete! Ready for operation.\r\n");
-    logsys::printf(
-        "[MPU9250] INT pin configured for data-ready interrupts\r\n");
     return true;
 }
 
@@ -935,132 +608,6 @@ inline bool MPU9250Driver::testConnection()
     return (who_am_i == MPU9250::MPU9250_WHO_AM_I_VALUE
         || who_am_i == MPU9250::MPU9255_WHO_AM_I_VALUE);
 }
-
-inline bool MPU9250Driver::enableDMP()
-{
-    // Enable DMP and FIFO
-    return i2c_->setBits(address_, MPU9250::USER_CTRL,
-        MPU9250::USER_CTRL_BITS::DMP_EN | MPU9250::USER_CTRL_BITS::FIFO_EN);
-}
-
-inline bool MPU9250Driver::disableDMP()
-{
-    dmp_enabled_ = false;
-    return i2c_->clearBits(address_, MPU9250::USER_CTRL,
-        MPU9250::USER_CTRL_BITS::DMP_EN | MPU9250::USER_CTRL_BITS::FIFO_EN);
-}
-
-inline bool MPU9250Driver::setDMPFeatures(uint16_t features)
-{
-    // Based on SparkFun library's dmp_enable_feature()
-    // This function writes to multiple DMP memory locations to configure
-    // features
-
-    // Enable 6-axis quaternion (CFG_8 = 2718)
-    if (features & MPU9250::DMP::FEATURE_6X_LP_QUAT) {
-        uint8_t quat_data[4]
-            = { 0x20, 0x28, 0x30, 0x38 }; // DINA20, DINA28, DINA30, DINA38
-        if (!writeDMPMemory(2718, quat_data, 4)) {
-            logsys::printf("[MPU9250] Failed to enable 6x quaternion\r\n");
-            return false;
-        }
-    }
-
-    // Enable gyro calibration (CFG_MOTION_BIAS = 1208)
-    if (features & MPU9250::DMP::FEATURE_GYRO_CAL) {
-        uint8_t gyro_cal_data[9]
-            = { 0xb8, 0xaa, 0xb3, 0x8d, 0xb4, 0x98, 0x0d, 0x35, 0x5d };
-        if (!writeDMPMemory(1208, gyro_cal_data, 9)) {
-            logsys::printf("[MPU9250] Failed to enable gyro calibration\r\n");
-            return false;
-        }
-    }
-
-    // Write integration scale factor (D_0_104 = 0x0668)
-    // GYRO_SF = 46850825 for 2000 dps gyro range
-    uint8_t gyro_sf[4] = { 0x02, 0xCB, 0x47, 0xA9 }; // 46850825 in hex
-    if (!writeDMPMemory(MPU9250::DMP::D_0_104, gyro_sf, 4)) {
-        logsys::printf("[MPU9250] Failed to write gyro scale factor\r\n");
-        return false;
-    }
-
-    // Enable or disable TAP feature (CFG_20 = 2224)
-    // TAP must be enabled for FIFO to work correctly (known MPU9250 issue)
-    if (features & MPU9250::DMP::FEATURE_TAP) {
-        uint8_t tap_enable = 0xF8;
-        if (!writeDMPMemory(2224, &tap_enable, 1)) {
-            logsys::printf("[MPU9250] Failed to enable TAP\r\n");
-            return false;
-        }
-    } else {
-        uint8_t tap_disable = 0xD8;
-        if (!writeDMPMemory(2224, &tap_disable, 1)) {
-            logsys::printf("[MPU9250] Failed to disable TAP\r\n");
-            return false;
-        }
-    }
-
-    // Configure what sensor data gets sent to FIFO (CFG_15 = 2727)
-    // All 0xA3 means no raw sensor data (we only want quaternion)
-    uint8_t fifo_sensors[10]
-        = { 0xA3, 0xA3, 0xA3, 0xA3, 0xA3, 0xA3, 0xA3, 0xA3, 0xA3, 0xA3 };
-    if (!writeDMPMemory(2727, fifo_sensors, 10)) {
-        logsys::printf("[MPU9250] Failed to configure FIFO sensors\r\n");
-        return false;
-    }
-
-    // Configure gesture data to FIFO (CFG_27 = 2742)
-    // When TAP is enabled, this should be 0x20 to send gesture data
-    uint8_t gesture_cfg = (features & MPU9250::DMP::FEATURE_TAP) ? 0x20 : 0xD8;
-    if (!writeDMPMemory(2742, &gesture_cfg, 1)) {
-        logsys::printf("[MPU9250] Failed to configure gesture FIFO\r\n");
-        return false;
-    }
-
-    // Reset FIFO after all feature configuration (matches SparkFun sequence)
-    if (!resetFIFO()) {
-        logsys::printf("[MPU9250] Failed to reset FIFO after features\r\n");
-        return false;
-    }
-
-    logsys::printf("[MPU9250] DMP features set: 0x%04X\r\n", features);
-    return true;
-}
-
-inline bool MPU9250Driver::setDMPSampleRate(uint16_t rate_hz)
-{
-    if (rate_hz < MPU9250::DMP::MIN_SAMPLE_RATE
-        || rate_hz > MPU9250::DMP::MAX_SAMPLE_RATE) {
-        return false;
-    }
-
-    // Calculate FIFO rate divider: DMP runs at 200Hz internally
-    // divider = (200 / desired_rate) - 1
-    uint16_t divider = (200 / rate_hz) - 1;
-
-    // Write to DMP memory at CFG_FIFO_RATE (D_0_22 = 22)
-    uint8_t rate_data[2] = { static_cast<uint8_t>((divider >> 8) & 0xFF),
-        static_cast<uint8_t>(divider & 0xFF) };
-
-    if (!writeDMPMemory(MPU9250::DMP::D_0_22, rate_data, 2)) {
-        logsys::printf("[MPU9250] Failed to set DMP sample rate divider\r\n");
-        return false;
-    }
-
-    // CRITICAL: Also write to CFG_6 (address 2753) - required for FIFO to work!
-    // This data sequence is from SparkFun's dmp_set_fifo_rate function
-    uint8_t cfg6_data[12] = { 0xfe, 0xf2, 0xab, 0xc4, 0xaa, 0xf1, 0xdf, 0xdf,
-        0xbb, 0xaf, 0xdf, 0xdf };
-    if (!writeDMPMemory(2753, cfg6_data, 12)) {
-        logsys::printf("[MPU9250] Failed to write CFG_6\r\n");
-        return false;
-    }
-
-    logsys::printf("[MPU9250] DMP sample rate set: %dHz (divider=%d)\r\n",
-        rate_hz, divider);
-    return true;
-}
-
 inline bool MPU9250Driver::dataReady()
 {
     uint8_t status;
@@ -1068,48 +615,107 @@ inline bool MPU9250Driver::dataReady()
         return false;
     }
 
-    uint8_t mask = dmp_enabled_ ? MPU9250::INT_STATUS_BITS::DMP_INT
-                                : MPU9250::INT_STATUS_BITS::RAW_DATA_RDY_INT;
-    return (status & mask) != 0;
+    return (status & MPU9250::INT_STATUS_BITS::RAW_DATA_RDY_INT) != 0;
 }
 
 inline bool MPU9250Driver::update()
 {
-    if (!dmp_enabled_) {
-        readGyro(gyro_);
-        readAccel(accel_);
-        return true;
-    }
+    Vector3 gyro;
+    Vector3 accel;
 
-    uint16_t fifo_count = getFIFOCount();
-
-    if (fifo_count == 0) {
+    if (!readGyro(gyro) || !readAccel(accel)) {
         return false;
     }
 
-    if (fifo_count >= MPU9250::FIFO_MAX_SIZE) {
-        logsys::printf("[MPU9250] FIFO overflow! Resetting...\r\n");
-        resetFIFO();
-        return false;
+    Vector3 mag;
+    const Vector3* mag_ptr = nullptr;
+    if (mag_enabled_ && readMag(mag)) {
+        mag_ptr = &mag;
     }
 
-    uint8_t packet[MPU9250::DMP::BALANCE_PACKET_SIZE];
+    const uint32_t now_ms = HAL_GetTick();
+    float dt_ms = 0.0f;
+    if (last_update_ms_ != 0) {
+        dt_ms = static_cast<float>(now_ms - last_update_ms_);
+    }
+    last_update_ms_ = now_ms;
 
-    if (fifo_count >= MPU9250::DMP::BALANCE_PACKET_SIZE) {
-        if (!readFIFO(packet, MPU9250::DMP::BALANCE_PACKET_SIZE)) {
-            return false;
-        }
+    updateOrientation(gyro, accel, mag_ptr, dt_ms);
+    return true;
+}
 
-        if (!processDMPPacket(packet, MPU9250::DMP::BALANCE_PACKET_SIZE)) {
-            return false;
-        }
+inline void MPU9250Driver::updateOrientation(
+    const Vector3& gyro, const Vector3& accel, const Vector3* mag,
+    float dt_ms)
+{
+    // Use a copy so we can flip sign when Z is inverted (sensor upside-down)
+    float ax = accel.x;
+    float ay = accel.y;
+    float az = accel.z;
 
-        quaternionToEuler(quat_, euler_);
-
-        return true;
+    if (az < 0.0f) {
+        ax = -ax;
+        ay = -ay;
+        az = -az;
     }
 
-    return false;
+    const float roll_rad = atan2f(ay, az);
+    const float pitch_rad = atan2f(-ax, sqrtf(ay * ay + az * az));
+
+    float yaw_deg = euler_.yaw;
+    // Integrate gyro Z if no magnetometer heading
+    if (!mag && dt_ms > 0.0f) {
+        yaw_deg += gyro.z * (dt_ms / 1000.0f);
+    }
+
+    if (mag) {
+        const float cr = cosf(roll_rad);
+        const float sr = sinf(roll_rad);
+        const float cp = cosf(pitch_rad);
+        const float sp = sinf(pitch_rad);
+
+        const float mx = mag->x;
+        const float my = mag->y;
+        const float mz = mag->z;
+
+        const float Xh = mx * cp + mz * sp;
+        const float Yh = mx * sr * sp + my * cr - mz * sr * cp;
+
+        yaw_deg = atan2f(-Yh, Xh) * 180.0f / M_PI;
+    }
+
+    while (yaw_deg < 0.0f) {
+        yaw_deg += 360.0f;
+    }
+    while (yaw_deg >= 360.0f) {
+        yaw_deg -= 360.0f;
+    }
+
+    euler_.roll = roll_rad * 180.0f / M_PI;
+    euler_.pitch = pitch_rad * 180.0f / M_PI;
+    euler_.yaw = yaw_deg;
+
+    eulerToQuaternion();
+}
+
+inline void MPU9250Driver::eulerToQuaternion()
+{
+    const float half_roll = euler_.roll * (M_PI / 180.0f) * 0.5f;
+    const float half_pitch = euler_.pitch * (M_PI / 180.0f) * 0.5f;
+    const float half_yaw = euler_.yaw * (M_PI / 180.0f) * 0.5f;
+
+    const float cr = cosf(half_roll);
+    const float sr = sinf(half_roll);
+    const float cp = cosf(half_pitch);
+    const float sp = sinf(half_pitch);
+    const float cy = cosf(half_yaw);
+    const float sy = sinf(half_yaw);
+
+    quat_.w = cr * cp * cy + sr * sp * sy;
+    quat_.x = sr * cp * cy - cr * sp * sy;
+    quat_.y = cr * sp * cy + sr * cp * sy;
+    quat_.z = cr * cp * sy - sr * sp * cy;
+    quat_.normalize();
 }
 
 inline bool MPU9250Driver::readGyro(Vector3& gyro)
@@ -1178,9 +784,15 @@ inline bool MPU9250Driver::readMag(Vector3& mag)
     int16_t raw_y = (static_cast<int16_t>(data[3]) << 8) | data[2];
     int16_t raw_z = (static_cast<int16_t>(data[5]) << 8) | data[4];
 
+    // Apply factory ASA scaling
     mag.x = static_cast<float>(raw_x) * mag_scale_x_;
     mag.y = static_cast<float>(raw_y) * mag_scale_y_;
     mag.z = static_cast<float>(raw_z) * mag_scale_z_;
+
+    // Apply user hard-iron offset and soft-iron scale if present
+    mag.x = (mag.x - mag_user_offset_.x) * mag_user_scale_.x;
+    mag.y = (mag.y - mag_user_offset_.y) * mag_user_scale_.y;
+    mag.z = (mag.z - mag_user_offset_.z) * mag_user_scale_.z;
 
     mag_ = mag;
     return true;
@@ -1307,15 +919,12 @@ inline bool MPU9250Driver::readFIFO(uint8_t* data, uint16_t length)
 
 inline bool MPU9250Driver::enableInterrupt()
 {
-    // For DMP mode: ONLY enable DMP_INT_EN (bit 1 = 0x02)
-    // Other interrupt bits (RAW_RDY, FIFO_OVERFLOW) interfere with DMP
-    // operation
-    uint8_t bits = MPU9250::INT_ENABLE_BITS::DMP_INT_EN; // 0x02 only
-
-    bool result = i2c_->writeRegister(address_, MPU9250::INT_ENABLE, bits);
+    const uint8_t bits = MPU9250::INT_ENABLE_BITS::RAW_RDY_EN;
+    const bool result
+        = i2c_->writeRegister(address_, MPU9250::INT_ENABLE, bits);
 
     if (result) {
-        logsys::printf("[MPU9250] INT_ENABLE = 0x%02X (DMP only)\r\n", bits);
+        logsys::printf("[MPU9250] INT_ENABLE = 0x%02X\r\n", bits);
     }
 
     return result;
@@ -1323,8 +932,7 @@ inline bool MPU9250Driver::enableInterrupt()
 
 inline bool MPU9250Driver::disableInterrupt()
 {
-    return i2c_->clearBits(
-        address_, MPU9250::INT_ENABLE, MPU9250::INT_ENABLE_BITS::RAW_RDY_EN);
+    return i2c_->writeRegister(address_, MPU9250::INT_ENABLE, 0x00);
 }
 
 inline bool MPU9250Driver::configureInterruptPin(
@@ -1396,6 +1004,7 @@ inline bool MPU9250Driver::initializeMagnetometer()
     HAL_Delay(10);
 
     logsys::printf("[MPU9250] Magnetometer initialized\r\n");
+    mag_enabled_ = true;
     return true;
 }
 
@@ -1443,6 +1052,56 @@ inline bool MPU9250Driver::calibrateGyro(uint16_t samples)
 inline bool MPU9250Driver::calibrateAccel(uint16_t samples)
 {
     // Placeholder - requires knowing device orientation
+    return true;
+}
+
+inline bool MPU9250Driver::calibrateMag(uint16_t samples, uint16_t delay_ms)
+{
+    if (!mag_enabled_) {
+        return false;
+    }
+
+    Vector3 mag_min(1e6f, 1e6f, 1e6f);
+    Vector3 mag_max(-1e6f, -1e6f, -1e6f);
+
+    for (uint16_t i = 0; i < samples; ++i) {
+        Vector3 m;
+        if (readMag(m)) {
+            mag_min.x = fminf(mag_min.x, m.x);
+            mag_min.y = fminf(mag_min.y, m.y);
+            mag_min.z = fminf(mag_min.z, m.z);
+
+            mag_max.x = fmaxf(mag_max.x, m.x);
+            mag_max.y = fmaxf(mag_max.y, m.y);
+            mag_max.z = fmaxf(mag_max.z, m.z);
+        }
+        HAL_Delay(delay_ms);
+    }
+
+    Vector3 offset((mag_min.x + mag_max.x) * 0.5f,
+        (mag_min.y + mag_max.y) * 0.5f, (mag_min.z + mag_max.z) * 0.5f);
+
+    Vector3 scale_delta((mag_max.x - mag_min.x) * 0.5f,
+        (mag_max.y - mag_min.y) * 0.5f, (mag_max.z - mag_min.z) * 0.5f);
+
+    const float avg_delta
+        = (scale_delta.x + scale_delta.y + scale_delta.z) / 3.0f;
+
+    Vector3 scale(1.0f, 1.0f, 1.0f);
+    if (scale_delta.x > 0.0f && scale_delta.y > 0.0f && scale_delta.z > 0.0f) {
+        scale.x = avg_delta / scale_delta.x;
+        scale.y = avg_delta / scale_delta.y;
+        scale.z = avg_delta / scale_delta.z;
+    }
+
+    mag_user_offset_ = offset;
+    mag_user_scale_ = scale;
+
+    logsys::printf("[MPU9250] Mag calib offset: %.2f %.2f %.2f\r\n",
+        offset.x, offset.y, offset.z);
+    logsys::printf("[MPU9250] Mag calib scale: %.3f %.3f %.3f\r\n", scale.x,
+        scale.y, scale.z);
+
     return true;
 }
 

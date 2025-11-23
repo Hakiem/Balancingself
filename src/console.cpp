@@ -72,6 +72,6 @@ void write(const char* msg)
         static_cast<uint16_t>(std::strlen(msg)), HAL_MAX_DELAY);
 }
 
-void print_banner() { write("\r\n=== TMC5160 SPI Demo ===\r\n"); }
+void print_banner() { write("\r\n=== Self Balancing Robot Demo ===\r\n"); }
 
 } // namespace console

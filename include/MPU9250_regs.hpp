@@ -1,10 +1,9 @@
 /**
  * @file MPU9250_regs.hpp
- * @brief Complete register map for MPU9250 9-axis IMU with DMP support
+ * @brief Complete register map for MPU9250 9-axis IMU
  *
  * Includes:
  * - MPU9250 primary registers (gyro, accel, temp, config)
- * - DMP (Digital Motion Processor) registers and memory banks
  * - AK8963 magnetometer registers (accessed via I2C bypass)
  * - Bit field definitions for configuration
  *
@@ -180,21 +179,6 @@ constexpr uint8_t ZA_OFFSET_H = 0x7D;
 constexpr uint8_t ZA_OFFSET_L = 0x7E;
 
 // ============================================================================
-// DMP (Digital Motion Processor) Registers
-// ============================================================================
-
-// DMP Memory Bank Selection
-constexpr uint8_t BANK_SEL = 0x6D;
-
-// DMP Memory Read/Write
-constexpr uint8_t MEM_START_ADDR = 0x6E;
-constexpr uint8_t MEM_R_W = 0x6F;
-
-// DMP Program Start Address
-constexpr uint8_t DMP_CFG_1 = 0x70;
-constexpr uint8_t DMP_CFG_2 = 0x71;
-
-// ============================================================================
 // AK8963 Magnetometer Register Map (accessed via I2C bypass or slave)
 // ============================================================================
 namespace AK8963
@@ -356,7 +340,6 @@ namespace INT_ENABLE_BITS
     constexpr uint8_t WOM_EN = (1 << 6); // Wake on motion interrupt
     constexpr uint8_t FIFO_OVERFLOW_EN = (1 << 4); // FIFO overflow interrupt
     constexpr uint8_t FSYNC_INT_EN = (1 << 3); // FSYNC interrupt enable
-    constexpr uint8_t DMP_INT_EN = (1 << 1); // DMP interrupt enable
     constexpr uint8_t RAW_RDY_EN = (1 << 0); // Raw data ready interrupt
 }
 
@@ -366,14 +349,12 @@ namespace INT_STATUS_BITS
     constexpr uint8_t WOM_INT = (1 << 6); // Wake on motion interrupt
     constexpr uint8_t FIFO_OVERFLOW_INT = (1 << 4); // FIFO overflow interrupt
     constexpr uint8_t FSYNC_INT = (1 << 3); // FSYNC interrupt occurred
-    constexpr uint8_t DMP_INT = (1 << 1); // DMP interrupt
     constexpr uint8_t RAW_DATA_RDY_INT = (1 << 0); // Raw data ready interrupt
 }
 
 // USER_CTRL register (0x6A)
 namespace USER_CTRL_BITS
 {
-    constexpr uint8_t DMP_EN = (1 << 7); // Enable DMP
     constexpr uint8_t FIFO_EN = (1 << 6); // Enable FIFO operation
     constexpr uint8_t I2C_MST_EN = (1 << 5); // Enable I2C Master mode
     constexpr uint8_t I2C_IF_DIS = (1 << 4); // Disable I2C slave (use SPI only)
@@ -441,277 +422,6 @@ namespace AK8963_BITS
 
     // CNTL2 register (0x0B) - Control 2
     constexpr uint8_t SRST = (1 << 0); // Soft reset
-}
-
-// ============================================================================
-// DMP Configuration Constants
-// ============================================================================
-namespace DMP
-{
-    // DMP memory bank size
-    constexpr uint16_t BANK_SIZE = 256;
-    constexpr uint8_t NUM_BANKS = 8;
-    constexpr uint16_t TOTAL_MEMORY_SIZE = BANK_SIZE * NUM_BANKS; // 2048 bytes
-
-    // DMP firmware image size (typically 3KB for MPU6050/9250)
-    constexpr uint16_t FIRMWARE_SIZE = 3062;
-
-    // ========================================================================
-    // DMP Memory Addresses (for configuration after firmware load)
-    // ========================================================================
-
-    // Feature configuration addresses
-    constexpr uint16_t D_0_22 = 0x0016; // Accel calibration
-    constexpr uint16_t D_0_24 = 0x0018;
-    constexpr uint16_t D_0_36 = 0x0024;
-    constexpr uint16_t D_0_52 = 0x0034;
-    constexpr uint16_t D_0_96 = 0x0060;
-    constexpr uint16_t D_0_104 = 0x0068;
-    constexpr uint16_t D_0_108 = 0x006C;
-    constexpr uint16_t D_0_163 = 0x00A3;
-    constexpr uint16_t D_0_188 = 0x00BC;
-    constexpr uint16_t D_0_192 = 0x00C0;
-    constexpr uint16_t D_0_224 = 0x00E0;
-    constexpr uint16_t D_0_228 = 0x00E4;
-    constexpr uint16_t D_0_232 = 0x00E8;
-    constexpr uint16_t D_0_236 = 0x00EC;
-
-    constexpr uint16_t D_1_2 = 0x0102;
-    constexpr uint16_t D_1_4 = 0x0104;
-    constexpr uint16_t D_1_8 = 0x0108;
-    constexpr uint16_t D_1_10 = 0x010A;
-    constexpr uint16_t D_1_24 = 0x0118;
-    constexpr uint16_t D_1_28 = 0x011C;
-    constexpr uint16_t D_1_36 = 0x0124;
-    constexpr uint16_t D_1_40 = 0x0128;
-    constexpr uint16_t D_1_44 = 0x012C;
-    constexpr uint16_t D_1_72 = 0x0148;
-    constexpr uint16_t D_1_74 = 0x014A;
-    constexpr uint16_t D_1_79 = 0x014F;
-    constexpr uint16_t D_1_88 = 0x0158;
-    constexpr uint16_t D_1_90 = 0x015A;
-    constexpr uint16_t D_1_92 = 0x015C;
-    constexpr uint16_t D_1_96 = 0x0160;
-    constexpr uint16_t D_1_98 = 0x0162;
-    constexpr uint16_t D_1_106 = 0x016A;
-    constexpr uint16_t D_1_108 = 0x016C;
-    constexpr uint16_t D_1_112 = 0x0170;
-    constexpr uint16_t D_1_128 = 0x0180;
-    constexpr uint16_t D_1_152 = 0x0198;
-    constexpr uint16_t D_1_160 = 0x01A0;
-    constexpr uint16_t D_1_176 = 0x01B0;
-    constexpr uint16_t D_1_178 = 0x01B2;
-    constexpr uint16_t D_1_218 = 0x01DA;
-    constexpr uint16_t D_1_232 = 0x01E8;
-    constexpr uint16_t D_1_236 = 0x01EC;
-    constexpr uint16_t D_1_240 = 0x01F0;
-    constexpr uint16_t D_1_244 = 0x01F4;
-    constexpr uint16_t D_1_250 = 0x01FA;
-    constexpr uint16_t D_1_252 = 0x01FC;
-
-    constexpr uint16_t D_2_12 = 0x020C;
-    constexpr uint16_t D_2_96 = 0x0260;
-    constexpr uint16_t D_2_108 = 0x026C;
-    constexpr uint16_t D_2_208 = 0x02D0;
-    constexpr uint16_t D_2_224 = 0x02E0;
-    constexpr uint16_t D_2_236 = 0x02EC;
-    constexpr uint16_t D_2_244 = 0x02F4;
-    constexpr uint16_t D_2_248 = 0x02F8;
-    constexpr uint16_t D_2_252 = 0x02FC;
-
-    // DMP configuration keys
-    constexpr uint16_t CFG_FIFO_ON_EVENT = 0x0A76; // Enable FIFO on DMP event
-    constexpr uint16_t CFG_GYRO_RAW_DATA = 0x0A3C; // Gyro raw data to FIFO
-    constexpr uint16_t CFG_ACCEL_RAW_DATA = 0x0A56; // Accel raw data to FIFO
-    constexpr uint16_t CFG_6_ORIENT_QUAT
-        = 0x0A48; // 6-axis orientation quaternion
-    constexpr uint16_t CFG_LP_QUAT = 0x0A40; // Low power quaternion
-    constexpr uint16_t CFG_FEATURE_FLAGS = 0x0A44; // Feature enable flags
-    constexpr uint16_t CFG_MOTION_BIAS = 0x0A4C; // Motion bias config
-    constexpr uint16_t CFG_GYRO_BIAS = 0x0A64; // Gyro bias storage
-    constexpr uint16_t CFG_ACCEL_BIAS = 0x0A6C; // Accel bias storage
-    constexpr uint16_t CFG_ANDROID_ORIENT_INT
-        = 0x0A84; // Android orientation interrupt
-    constexpr uint16_t CFG_GYRO_CALIBRATION = 0x0AB4; // Gyro calibration enable
-    constexpr uint16_t CFG_ACCEL_CALIBRATION
-        = 0x0ABC; // Accel calibration enable
-    constexpr uint16_t CFG_FIFO_RATE_DIV = 0x0A02; // FIFO rate divider
-    constexpr uint16_t CFG_SAMPLE_RATE = 0x0AEC; // Sample rate
-    constexpr uint16_t CFG_ORIENT_INT_TIMEOUT = 0x0A80; // Orientation timeout
-    constexpr uint16_t CFG_ORIENT_INT_THR = 0x0A88; // Orientation threshold
-    constexpr uint16_t CFG_TAP_TIME_MULTI = 0x0AA0; // Tap timing multi
-    constexpr uint16_t CFG_TAP_TIME = 0x0A9C; // Tap time window
-    constexpr uint16_t CFG_TAP_THRESH_X = 0x0A90; // Tap threshold X
-    constexpr uint16_t CFG_TAP_THRESH_Y = 0x0A94; // Tap threshold Y
-    constexpr uint16_t CFG_TAP_THRESH_Z = 0x0A98; // Tap threshold Z
-    constexpr uint16_t CFG_TAP_MIN_WAIT = 0x0AA4; // Min time between taps
-
-    // DMP start address (where DMP program execution begins)
-    constexpr uint16_t START_ADDRESS = 0x0400;
-
-    // ========================================================================
-    // DMP Feature Bits (for enabling specific DMP features)
-    // ========================================================================
-    constexpr uint16_t FEATURE_TAP = 0x0001; // Tap detection
-    constexpr uint16_t FEATURE_ANDROID_ORIENT
-        = 0x0002; // Android screen orientation
-    constexpr uint16_t FEATURE_LP_QUAT = 0x0004; // Low power quaternion
-    constexpr uint16_t FEATURE_PEDOMETER = 0x0008; // Pedometer (step counter)
-    constexpr uint16_t FEATURE_6X_LP_QUAT = 0x0010; // 6-axis LP quaternion
-    constexpr uint16_t FEATURE_GYRO_CAL = 0x0020; // Gyro auto-calibration
-    constexpr uint16_t FEATURE_SEND_RAW_ACCEL
-        = 0x0040; // Send raw accel to FIFO
-    constexpr uint16_t FEATURE_SEND_RAW_GYRO = 0x0080; // Send raw gyro to FIFO
-    constexpr uint16_t FEATURE_SEND_CAL_GYRO
-        = 0x0100; // Send calibrated gyro to FIFO
-
-    // Recommended feature combinations for balancing robot
-    // NOTE: TAP feature MUST be enabled to fix known FIFO sample rate issue
-    constexpr uint16_t FEATURES_BALANCE = FEATURE_TAP
-        | // TAP (required for FIFO to work correctly)
-        FEATURE_6X_LP_QUAT | // Quaternion for orientation
-        FEATURE_GYRO_CAL; // Auto gyro calibration
-    // FEATURE_SEND_RAW_ACCEL | // Raw accelerometer data
-    // FEATURE_SEND_CAL_GYRO; // Calibrated gyro data
-
-    // ========================================================================
-    // DMP Interrupt Modes
-    // ========================================================================
-    enum class InterruptMode : uint8_t {
-        CONTINUOUS = 0, // Generate interrupt continuously
-        GESTURE = 1 // Generate interrupt on gesture (tap, orientation)
-    };
-
-    // ========================================================================
-    // DMP Sample Rates
-    // ========================================================================
-    constexpr uint16_t MIN_SAMPLE_RATE = 4; // 4 Hz minimum
-    constexpr uint16_t MAX_SAMPLE_RATE = 200; // 200 Hz maximum
-    constexpr uint16_t DEFAULT_SAMPLE_RATE = 100; // 100 Hz (good for balancing)
-    constexpr uint16_t BALANCE_SAMPLE_RATE
-        = 10; // 10 Hz (start slow like SparkFun example, can increase later)
-
-    // DMP FIFO rate divider calculation
-    // Sample Rate = Gyro Output Rate / (1 + FIFO_RATE_DIV)
-    // For 1kHz gyro rate: FIFO_RATE_DIV = (1000 / desired_rate) - 1
-    constexpr uint16_t FIFO_RATE_DIV_200HZ = 4; // (1000/200) - 1 = 4
-    constexpr uint16_t FIFO_RATE_DIV_100HZ = 9; // (1000/100) - 1 = 9
-    constexpr uint16_t FIFO_RATE_DIV_50HZ = 19; // (1000/50) - 1 = 19
-
-    // ========================================================================
-    // DMP Output Packet Formats
-    // ========================================================================
-
-    // Packet sizes (bytes)
-    constexpr uint8_t QUAT_PACKET_SIZE = 16; // Quaternion only (q0, q1, q2, q3)
-    constexpr uint8_t ACCEL_PACKET_SIZE = 6; // Accel XYZ (3x 16-bit)
-    constexpr uint8_t GYRO_PACKET_SIZE = 6; // Gyro XYZ (3x 16-bit)
-    constexpr uint8_t QUAT6_PACKET_SIZE = 12; // 6-axis quaternion (compressed)
-    constexpr uint8_t PACKET_HEADER_SIZE = 2; // DMP packet header
-
-    // Full packet with all features enabled
-    constexpr uint8_t FULL_PACKET_SIZE = PACKET_HEADER_SIZE + // 2 bytes header
-        QUAT_PACKET_SIZE + // 16 bytes quaternion
-        ACCEL_PACKET_SIZE + // 6 bytes accel
-        GYRO_PACKET_SIZE; // 6 bytes gyro
-                          // Total: 30 bytes
-
-    // Recommended packet for balancing
-    // With DMP_FEATURE_TAP | DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_GYRO_CAL
-    // (0x0031) TAP must be enabled for FIFO to work (known MPU9250 bug
-    // workaround)
-    constexpr uint8_t BALANCE_PACKET_SIZE = 20; // 16 bytes quat + 4 bytes
-                                                // gesture Total: 20 bytes
-
-    // Packet header constants
-    constexpr uint8_t PACKET_HEADER_QUAT = 0x80; // Quaternion data follows
-    constexpr uint8_t PACKET_HEADER_ACCEL = 0x40; // Accel data follows
-    constexpr uint8_t PACKET_HEADER_GYRO = 0x20; // Gyro data follows
-
-    // ========================================================================
-    // DMP Quaternion Scaling
-    // ========================================================================
-
-    // DMP outputs quaternions as 32-bit integers (Q30 format)
-    // To convert to float: float_quat = int32_quat / (1 << 30)
-    constexpr float QUAT_SCALE = 1073741824.0f; // 2^30
-
-    // Normalized quaternion magnitude should be close to 1.0
-    constexpr float QUAT_MAG_MIN = 0.95f;
-    constexpr float QUAT_MAG_MAX = 1.05f;
-
-    // ========================================================================
-    // DMP Gyro Bias Storage
-    // ========================================================================
-
-    // DMP stores gyro bias internally and applies it automatically
-    // Bias values are in hardware units (16-bit signed)
-    constexpr int16_t MAX_GYRO_BIAS = 1000; // Maximum expected bias (LSB)
-
-    // Gyro bias update rate (how fast DMP adapts to drift)
-    enum class GyroBiasUpdateRate : uint8_t {
-        SLOW = 0, // Update slowly (more stable)
-        MEDIUM = 1, // Medium update rate
-        FAST = 2 // Update quickly (less stable, faster adaptation)
-    };
-
-    // ========================================================================
-    // DMP Tap Detection Configuration
-    // ========================================================================
-
-    // Tap thresholds (in mg, divide by 4 to get DMP units)
-    constexpr uint16_t DEFAULT_TAP_THRESH = 250; // 250 mg
-    constexpr uint16_t TAP_TIME_MIN = 100; // 100 ms minimum tap time
-    constexpr uint16_t TAP_TIME_MAX = 300; // 300 ms maximum tap time
-    constexpr uint16_t TAP_MULTI_TIMEOUT = 500; // 500 ms for double-tap
-
-    // Tap axes
-    constexpr uint8_t TAP_X_EN = (1 << 3);
-    constexpr uint8_t TAP_Y_EN = (1 << 4);
-    constexpr uint8_t TAP_Z_EN = (1 << 5);
-    constexpr uint8_t TAP_ALL_AXES = TAP_X_EN | TAP_Y_EN | TAP_Z_EN;
-
-    // ========================================================================
-    // DMP Android Orientation
-    // ========================================================================
-
-    enum class AndroidOrientation : uint8_t {
-        PORTRAIT = 0,
-        LANDSCAPE = 1,
-        REVERSE_PORTRAIT = 2,
-        REVERSE_LANDSCAPE = 3
-    };
-
-    // ========================================================================
-    // DMP Pedometer Configuration
-    // ========================================================================
-
-    constexpr uint16_t PEDOMETER_WALK_TIME
-        = 200; // 200 ms min time between steps
-    constexpr uint16_t PEDOMETER_STEP_THRESH = 0; // Step detection threshold
-
-    // ========================================================================
-    // Helper Functions for DMP Configuration
-    // ========================================================================
-
-    // Calculate FIFO rate divider from desired sample rate
-    constexpr uint16_t calcFifoRateDiv(
-        uint16_t sample_rate_hz, uint16_t gyro_rate_hz = 1000)
-    {
-        return (gyro_rate_hz / sample_rate_hz) - 1;
-    }
-
-    // Convert quaternion from DMP int32 format to float
-    constexpr float quatToFloat(int32_t quat_int32)
-    {
-        return static_cast<float>(quat_int32) / QUAT_SCALE;
-    }
-
-    // Convert tap threshold from mg to DMP units
-    constexpr uint16_t tapThreshToDMP(uint16_t thresh_mg)
-    {
-        return thresh_mg / 4; // DMP units are mg/4
-    }
 }
 
 // ============================================================================
